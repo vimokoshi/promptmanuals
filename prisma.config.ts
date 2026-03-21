@@ -10,4 +10,8 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   engine: "classic",
+  datasource: {
+    // Fallback allows prisma generate during build without a live DB connection
+    url: process.env.DATABASE_URL ?? "postgresql://dummy:dummy@localhost:5432/dummy",
+  },
 });
