@@ -37,8 +37,7 @@ export function Providers({ children, locale, messages, theme, branding }: Provi
       <NextIntlClientProvider locale={locale} messages={messages}>
         <ThemeProvider
           attribute="class"
-          defaultTheme="system"
-          enableSystem
+          defaultTheme="light"
           disableTransitionOnChange
         >
           <ThemeStyles 
