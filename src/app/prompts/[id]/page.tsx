@@ -773,6 +773,21 @@ export default async function PromptPage({ params }: PromptPageProps) {
             translations={prompt.translations as Record<string, { title?: string }> | null}
           />
 
+          {/* FAQ Section — from WF04 seoMeta */}
+          {seoMetaData?.faq_pairs && seoMetaData.faq_pairs.length > 0 && (
+            <div className="mt-6 pt-6 border-t space-y-4">
+              <h2 className="text-base font-semibold">Frequently Asked Questions</h2>
+              <dl className="space-y-4">
+                {seoMetaData.faq_pairs.map((pair, i) => (
+                  <div key={i} className="space-y-1">
+                    <dt className="text-sm font-medium">{pair.question}</dt>
+                    <dd className="text-sm text-muted-foreground">{pair.answer}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+
           {/* Report & Prompt Flow - hide for SKILL and TASTE types */}
           {prompt.type !== "SKILL" && prompt.type !== "TASTE" && (
             <PromptFlowSection
