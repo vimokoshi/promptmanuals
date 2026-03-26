@@ -1,4 +1,5 @@
 import { Metadata } from "next";
+import { unstable_cache } from "next/cache";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { getTranslations, getLocale } from "next-intl/server";
@@ -33,6 +34,8 @@ import { getConfig } from "@/lib/config";
 import { StructuredData } from "@/components/seo/structured-data";
 import { AI_MODELS } from "@/lib/works-best-with";
 import { EzoicAd } from "@/components/ads/ezoic-ad";
+import { TestPromptSidebar } from "@/components/prompts/test-prompt-sidebar";
+import { PromptLanguageRow } from "@/components/prompts/prompt-language-row";
 
 interface PromptPageProps {
   params: Promise<{ id: string }>;
@@ -57,21 +60,71 @@ function extractPromptId(idParam: string): string {
 }
 
 
+const TRANSLATED_LANGS = ["es","zh","ja","de","fr","pt","ko","tr","ar","ru","hi","bn","ta","te","mr","gu"] as const;
+
+/** Cached prompt metadata fetch — 1 hour TTL, keyed by prompt ID. */
+const getPromptMetadata = unstable_cache(
+  async (id: string) => db.prompt.findUnique({
+    where: { id },
+    select: {
+      title: true,
+      description: true,
+      slug: true,
+      content: true,
+      seoMeta: true,
+      translations: true,
+      category: { select: { name: true } },
+    },
+  }),
+  ["prompt-metadata"],
+  { revalidate: 3600, tags: ["prompts"] },
+);
+
 export async function generateMetadata({ params }: PromptPageProps): Promise<Metadata> {
   const { id: idParam } = await params;
   const id = extractPromptId(idParam);
-  const prompt = await db.prompt.findUnique({
-    where: { id },
-    select: { title: true, description: true },
-  });
+  const prompt = await getPromptMetadata(id);
 
   if (!prompt) {
     return { title: "Prompt Not Found" };
   }
 
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://www.promptmanuals.com";
+  const canonicalUrl = `${baseUrl}/prompts/${id}_${prompt.slug}`;
+  const categoryName = prompt.category?.name || "AI";
+  const seoTitle = `${prompt.title} — ${categoryName} AI Prompt | Prompt Manuals`;
+  const seoMeta = prompt.seoMeta as { meta_description?: string } | null;
+  const description = seoMeta?.meta_description || prompt.description || `${prompt.content.substring(0, 120)}...`;
+
+  // Build hreflang alternates for all translated languages that have content
+  const translations = prompt.translations as Record<string, { title?: string; content?: string }> | null;
+  const langAlternates: Record<string, string> = { "x-default": canonicalUrl, en: canonicalUrl };
+  if (translations) {
+    for (const lang of TRANSLATED_LANGS) {
+      if (translations[lang]?.title) {
+        langAlternates[lang] = `${baseUrl}/prompts/${id}_${prompt.slug}/${lang}`;
+      }
+    }
+  }
+
   return {
-    title: prompt.title,
-    description: prompt.description || `View the prompt: ${prompt.title}`,
+    title: seoTitle,
+    description,
+    alternates: {
+      canonical: canonicalUrl,
+      languages: langAlternates,
+    },
+    openGraph: {
+      title: seoTitle,
+      description,
+      url: canonicalUrl,
+      type: "article",
+    },
+    twitter: {
+      card: "summary_large_image",
+      title: seoTitle,
+      description,
+    },
   };
 }
 
@@ -276,6 +329,14 @@ export default async function PromptPage({ params }: PromptPageProps) {
   const bestWithModels = (prompt as unknown as { bestWithModels?: string[] }).bestWithModels || [];
   const bestWithMCP = (prompt as unknown as { bestWithMCP?: { command: string; tools?: string[] }[] }).bestWithMCP || [];
 
+  // seoMeta from WF04 pipeline
+  const seoMetaData = prompt.seoMeta as {
+    meta_description?: string;
+    faq_pairs?: { question: string; answer: string }[];
+    how_to_steps?: string[];
+    voice_summary?: string;
+  } | null;
+
   return (
     <>
       {/* Structured Data for Rich Results */}
@@ -308,7 +369,36 @@ export default async function PromptPage({ params }: PromptPageProps) {
           ],
         }}
       />
-      <div className="container max-w-4xl py-8">
+      {/* FAQPage — WF04 seoMeta faq_pairs or fallback */}
+      <StructuredData
+        type="faq"
+        data={{
+          faq: seoMetaData?.faq_pairs?.length
+            ? seoMetaData.faq_pairs
+            : [
+                {
+                  question: `What is the ${prompt.title} prompt?`,
+                  answer: prompt.description || `The ${prompt.title} prompt is an AI instruction you can use in ChatGPT, Claude, Gemini, and other AI tools to ${prompt.title.toLowerCase()}.`,
+                },
+                {
+                  question: `How do I use the ${prompt.title} prompt?`,
+                  answer: `Copy the prompt from Prompt Manuals, paste it into ChatGPT, Claude, Gemini, or your preferred AI tool, and press send. The AI will follow the instructions immediately.`,
+                },
+                {
+                  question: `Which AI tools work with this ${prompt.category?.name || "AI"} prompt?`,
+                  answer: `This prompt works with all major AI assistants including ChatGPT (GPT-4o), Claude (Anthropic), Google Gemini, Microsoft Copilot, and any other instruction-following language model.`,
+                },
+              ],
+        }}
+      />
+      {/* Speakable — targets Google Assistant voice results */}
+      <StructuredData
+        type="speakable"
+        data={{ speakable: { cssSelector: ["h1", ".prompt-description", ".prompt-content"] } }}
+      />
+      <div className="container py-8">
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr_260px] gap-8 items-start">
+        <div>{/* main content */}
         {/* Deleted Banner - shown to admins when prompt is deleted */}
       {prompt.deletedAt && isAdmin && (
         <div className="mb-6 p-4 rounded-lg border border-red-500/30 bg-red-500/5">
@@ -572,8 +662,8 @@ export default async function PromptPage({ params }: PromptPageProps) {
                 promptSlug={prompt.slug ?? undefined}
               />
             ) : prompt.type === "TASTE" ? (
-              <InteractivePromptContent 
-                content={prompt.content} 
+              <InteractivePromptContent
+                content={prompt.content}
                 title="taste.md"
                 isLoggedIn={!!session?.user}
                 promptId={prompt.id}
@@ -582,10 +672,11 @@ export default async function PromptPage({ params }: PromptPageProps) {
                 shareTitle={prompt.title}
                 promptTitle={prompt.title}
                 promptDescription={prompt.description ?? undefined}
+                hidePlatformLauncher
               />
             ) : prompt.structuredFormat ? (
-              <InteractivePromptContent 
-                content={prompt.content} 
+              <InteractivePromptContent
+                content={prompt.content}
                 isStructured={true}
                 structuredFormat={(prompt.structuredFormat?.toLowerCase() as "json" | "yaml") || "json"}
                 title={t("promptContent")}
@@ -598,11 +689,12 @@ export default async function PromptPage({ params }: PromptPageProps) {
                 shareTitle={prompt.title}
                 promptTitle={prompt.title}
                 promptDescription={prompt.description ?? undefined}
+                hidePlatformLauncher
               />
             ) : (
-              <InteractivePromptContent 
-                content={prompt.content} 
-                title={t("promptContent")} 
+              <InteractivePromptContent
+                content={prompt.content}
+                title={t("promptContent")}
                 isLoggedIn={!!session?.user}
                 categoryName={prompt.category?.name}
                 parentCategoryName={prompt.category?.parent?.name}
@@ -612,6 +704,7 @@ export default async function PromptPage({ params }: PromptPageProps) {
                 shareTitle={prompt.title}
                 promptTitle={prompt.title}
                 promptDescription={prompt.description ?? undefined}
+                hidePlatformLauncher
               />
             )}
           </div>
@@ -671,6 +764,14 @@ export default async function PromptPage({ params }: PromptPageProps) {
               </div>
             </div>
           )}
+
+          {/* Language row — links to translated URL pages */}
+          <PromptLanguageRow
+            currentLocale={locale}
+            promptId={prompt.id}
+            promptSlug={prompt.slug ?? ""}
+            translations={prompt.translations as Record<string, { title?: string }> | null}
+          />
 
           {/* Report & Prompt Flow - hide for SKILL and TASTE types */}
           {prompt.type !== "SKILL" && prompt.type !== "TASTE" && (
@@ -878,6 +979,12 @@ export default async function PromptPage({ params }: PromptPageProps) {
         </div>
       )}
 
+        </div>{/* end main content */}
+
+        {/* Sidebar */}
+        <TestPromptSidebar content={prompt.content} />
+
+        </div>{/* end grid */}
       </div>
     </>
   );

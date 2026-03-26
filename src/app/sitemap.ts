@@ -51,13 +51,15 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     priority: 0.7,
   }));
 
+  const TRANSLATED_LANGS = ["es","zh","ja","de","fr","pt","ko","tr","ar","ru","hi","bn","ta","te","mr","gu"] as const;
+
   // Dynamic pages - skip if database is unavailable (e.g., during build)
   try {
     const [categories, prompts, tags] = await Promise.all([
       db.category.findMany({ select: { slug: true } }),
       db.prompt.findMany({
         where: { isPrivate: false, deletedAt: null, isUnlisted: false },
-        select: { id: true, slug: true, updatedAt: true },
+        select: { id: true, slug: true, updatedAt: true, translations: true },
         orderBy: { updatedAt: "desc" },
         take: 1000,
       }),
@@ -78,6 +80,20 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
       priority: 0.6,
     }));
 
+    // Translated pages — one URL per language per prompt that has translation
+    const translatedPages: MetadataRoute.Sitemap = prompts.flatMap((prompt) => {
+      const translations = prompt.translations as Record<string, { title?: string }> | null;
+      if (!translations) return [];
+      return TRANSLATED_LANGS
+        .filter((lang) => translations[lang]?.title)
+        .map((lang) => ({
+          url: `${baseUrl}/prompts/${prompt.id}_${prompt.slug}/${lang}`,
+          lastModified: prompt.updatedAt,
+          changeFrequency: "monthly" as const,
+          priority: 0.5,
+        }));
+    });
+
     const tagPages: MetadataRoute.Sitemap = tags.map((tag) => ({
       url: `${baseUrl}/tags/${tag.slug}`,
       lastModified: new Date(),
@@ -85,7 +101,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
       priority: 0.5,
     }));
 
-    return [...staticPages, ...bookPages, ...categoryPages, ...promptPages, ...tagPages];
+    return [...staticPages, ...bookPages, ...categoryPages, ...promptPages, ...translatedPages, ...tagPages];
   } catch {
     // Database unavailable (build time) - return static and book pages only
     return [...staticPages, ...bookPages];
