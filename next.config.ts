@@ -37,6 +37,13 @@ const nextConfig: NextConfig = {
       },
     ],
   },
+  // Rewrites
+  async rewrites() {
+    return [
+      { source: "/sitemap.xml",         destination: "/sitemap-index" },
+      { source: "/sitemap/:id(\\d+).xml", destination: "/sitemap-page/:id" },
+    ];
+  },
   // Redirects
   async redirects() {
     return [
@@ -55,10 +62,10 @@ const nextConfig: NextConfig = {
         destination: "/embed",
         permanent: true,
       },
-      // Redirect book PDF downloads to GitHub raw to save Vercel edge bandwidth
+      // Redirect book PDF downloads to GitHub raw to save edge bandwidth
       {
         source: "/book-pdf/:filename",
-        destination: "https://raw.githubusercontent.com/f/prompts.chat/refs/heads/main/public/book-pdf/:filename",
+        destination: "https://raw.githubusercontent.com/vimokoshi/promptmanuals/refs/heads/main/public/book-pdf/:filename",
         permanent: false,
       },
     ];
