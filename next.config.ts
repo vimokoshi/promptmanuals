@@ -11,6 +11,10 @@ const withMDX = createMDX({
 const nextConfig: NextConfig = {
   pageExtensions: ["js", "jsx", "md", "mdx", "ts", "tsx"],
   reactCompiler: false,
+  // Required: Cloudflare Pages runs build from repo root, not app/.
+  // Without this: bundler finds C:\Nebula\pages (from monorepo) and throws
+  // "pages and app directories should be under the same folder".
+  outputFileTracingRoot: __dirname,
   // Configure webpack for raw imports
   webpack: (config) => {
     config.module.rules.push({
