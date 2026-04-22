@@ -20,8 +20,6 @@ const nextConfig: NextConfig = {
     });
     return config;
   },
-  // Enable standalone output for Docker
-  output: "standalone",
   // Experimental features
   experimental: {
     // Enable server actions
@@ -29,10 +27,6 @@ const nextConfig: NextConfig = {
       bodySizeLimit: "2mb",
     },
   },
-  // Required: Cloudflare Pages runs build from repo root, not app/.
-  // Without this: bundler finds C:\Nebula\pages (from monorepo) and throws
-  // "pages and app directories should be under the same folder".
-  outputFileTracingRoot: path.resolve(__dirname, ".."),
   // Image optimization
   images: {
     remotePatterns: [
