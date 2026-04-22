@@ -1,0 +1,12 @@
+[build]
+builder = "NIXPACKS"
+builderConfig = { "NIXPACKS_PLAN" = "nodejs" }
+rootDirectory = "app"
+
+[deploy]
+healthcheckPath = "/api/health"
+healthcheckTimeout = 120
+restartTimeout = 60
+
+[start]
+command = "node .next/standalone/server.js"
