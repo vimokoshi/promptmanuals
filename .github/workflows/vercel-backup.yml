@@ -1,0 +1,83 @@
+name: Backup to GitHub
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel
+
+      - name: Pull from Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          vercel link \
+            --org=team_eynfBSLB3HYyqJsWIG11urnr \
+            --project=promptmanuals.com \
+            --token="$VERCEL_TOKEN" \
+            --yes
+          vercel pull \
+            --environment=production \
+            --token="$VERCEL_TOKEN" \
+            --yes
+          rm -rf .vercel
+
+      - name: Build backup dir
+        run: |
+          mkdir -p pmx-backup
+
+          # Core source dirs (top-level, not nested)
+          cp -r app/ src/ packages/ messages/ docker/ pmx-backup/ 2>/dev/null || true
+
+          # Config files
+          cp next.config.ts package.json package-lock.json tsconfig.json pmx-backup/ 2>/dev/null || true
+          cp wrangler.toml .vercelignore .dockerignore eslint.config.mjs mdx-components.tsx pmx-backup/ 2>/dev/null || true
+
+          # Dev docs
+          cp AGENTS.md CLAUDE.md CONTRIBUTING.md CREDENTIALS.md README.md pmx-backup/ 2>/dev/null || true
+
+          # Restore script
+          mkdir -p pmx-backup/scripts
+          cp scripts/restore-vercel.sh pmx-backup/scripts/ 2>/dev/null || true
+
+      - name: Clean excluded artifacts
+        run: |
+          # Remove build artifacts and secrets
+          find pmx-backup -name '.next' -type d -exec rm -rf {} + 2>/dev/null || true
+          find pmx-backup -name 'node_modules' -type d -exec rm -rf {} + 2>/dev/null || true
+          find pmx-backup -name '.git' -type d -exec rm -rf {} + 2>/dev/null || true
+          find pmx-backup -name 'tsconfig.tsbuildinfo' -delete 2>/dev/null || true
+          find pmx-backup -name '*.log' -delete 2>/dev/null || true
+          find pmx-backup -name '.env*' -delete 2>/dev/null || true
+          find pmx-backup -path '*/app/app' -type d -exec rm -rf {} + 2>/dev/null || true
+          find pmx-backup -path '*/app/node_modules' -type d -exec rm -rf {} + 2>/dev/null || true
+          find pmx-backup -path '*/app/.next' -type d -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Push to pmx
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          cd pmx-backup
+          git init
+          git config user.name "Vercel Backup Bot"
+          git config user.email "backup@promptmanuals.com"
+          git add -A
+          git commit -m "chore: backup $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git remote add origin "https://x-access-token:${GH_PAT}@github.com/vimokoshi/pmx.git"
+          git push -f origin main
