@@ -1,7 +1,7 @@
 [build]
 builder = "NIXPACKS"
 builderConfig = { "NIXPACKS_PLAN" = "nodejs" }
-rootDirectory = "app"
+rootDirectory = ""
 
 [deploy]
 healthcheckPath = "/api/health"
