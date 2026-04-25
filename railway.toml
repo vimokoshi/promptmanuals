@@ -1,6 +1,6 @@
 [build]
 builder = "NIXPACKS"
-builderConfig = { "NIXPACKS_PLAN" = "nodejs" }
+builderConfig = { "NIXPACKS_PLAN" = "nodejs_22" }
 rootDirectory = ""
 
 [deploy]
