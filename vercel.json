@@ -1,0 +1,9 @@
+{
+  "buildCommand": "prisma generate && next build",
+  "functions": {
+    "src/app/**/*": {
+      "maxDuration": 30
+    }
+  },
+  "outputDirectory": ".next"
+}
