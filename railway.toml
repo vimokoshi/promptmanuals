@@ -1,11 +1,11 @@
 [build]
 builder = "NIXPACKS"
-builderConfig = { "NIXPACKS_PLAN" = "nodejs" }
-rootDirectory = "app"
+builderConfig = { "NIXPACKS_PLAN" = "nodejs_22" }
+rootDirectory = ""
 
 [deploy]
 healthcheckPath = "/api/health"
-healthcheckTimeout = 120
+healthcheckTimeout = 180
 restartTimeout = 60
 
 [start]
