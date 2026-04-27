@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, changeRequestsCol, usersCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
+import { randomUUID } from "crypto";
 
 const updateChangeRequestSchema = z.object({
   status: z.enum(["APPROVED", "REJECTED", "PENDING"]),
@@ -23,11 +25,21 @@ export async function PATCH(
 
     const { id: promptId, changeId } = await params;
 
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
     // Check if prompt exists and user is owner
-    const prompt = await db.prompt.findUnique({
-      where: { id: promptId },
-      select: { authorId: true, content: true, title: true },
-    });
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid },
+      { projection: { authorId: 1, content: 1, title: 1, versions: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json(
@@ -43,22 +55,18 @@ export async function PATCH(
       );
     }
 
+    let changeOid: ObjectId;
+    try {
+      changeOid = new ObjectId(changeId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Change request not found" },
+        { status: 404 }
+      );
+    }
+
     // Get change request
-    const changeRequest = await db.changeRequest.findUnique({
-      where: { id: changeId },
-      select: { 
-        id: true, 
-        promptId: true, 
-        status: true, 
-        proposedContent: true, 
-        proposedTitle: true,
-        authorId: true,
-        reason: true,
-        author: {
-          select: { username: true },
-        },
-      },
-    });
+    const changeRequest = await changeRequestsCol().findOne({ _id: changeOid });
 
     if (!changeRequest || changeRequest.promptId !== promptId) {
       return NextResponse.json(
@@ -66,6 +74,12 @@ export async function PATCH(
         { status: 404 }
       );
     }
+
+    // Fetch author username for change note
+    const crAuthor = await usersCol().findOne(
+      { _id: changeRequest.authorId as any },
+      { projection: { username: 1 } }
+    );
 
     const body = await request.json();
     const parsed = updateChangeRequestSchema.safeParse(body);
@@ -102,66 +116,67 @@ export async function PATCH(
       );
     }
 
+    const now = new Date();
+
     // If reopening, just update status
     if (status === "PENDING") {
-      await db.changeRequest.update({
-        where: { id: changeId },
-        data: { status, reviewNote: null },
-      });
+      await changeRequestsCol().updateOne(
+        { _id: changeOid },
+        { $set: { status, reviewNote: null, updatedAt: now } }
+      );
       return NextResponse.json({ success: true, status });
     }
 
     // If approving, also update the prompt content
     if (status === "APPROVED") {
-      // Get current version number
-      const latestVersion = await db.promptVersion.findFirst({
-        where: { promptId },
-        orderBy: { version: "desc" },
-        select: { version: true },
-      });
-
-      const nextVersion = (latestVersion?.version ?? 0) + 1;
+      // Get current version number from embedded array
+      const versions = prompt.versions ?? [];
+      const latestVersionNum = versions.reduce(
+        (max, v) => Math.max(max, v.version),
+        0
+      );
+      const nextVersion = latestVersionNum + 1;
 
       // Build change note with contributor info
-      const changeNote = changeRequest.reason 
-        ? `Contribution by @${changeRequest.author.username}: ${changeRequest.reason}`
-        : `Contribution by @${changeRequest.author.username}`;
+      const changeNote = changeRequest.reason
+        ? `Contribution by @${crAuthor?.username ?? changeRequest.authorId}: ${changeRequest.reason}`
+        : `Contribution by @${crAuthor?.username ?? changeRequest.authorId}`;
 
-      // Update prompt and create version in transaction
-      await db.$transaction([
-        // Create version record with the NEW content (the approved change)
-        db.promptVersion.create({
-          data: {
-            prompt: { connect: { id: promptId } },
-            content: changeRequest.proposedContent,
-            changeNote,
-            version: nextVersion,
-            author: { connect: { id: changeRequest.authorId } },
-          },
-        }),
-        // Update prompt with proposed changes and add contributor
-        db.prompt.update({
-          where: { id: promptId },
-          data: {
-            content: changeRequest.proposedContent,
-            ...(changeRequest.proposedTitle && { title: changeRequest.proposedTitle }),
-            contributors: {
-              connect: { id: changeRequest.authorId },
+      const newVersion = {
+        _id: randomUUID(),
+        version: nextVersion,
+        content: changeRequest.proposedContent,
+        changeNote,
+        createdAt: now,
+        createdBy: changeRequest.authorId,
+      };
+
+      // Execute all updates
+      await Promise.all([
+        // Push new version + update prompt content
+        promptsCol().updateOne(
+          { _id: promptOid },
+          {
+            $push: { versions: newVersion } as any,
+            $set: {
+              content: changeRequest.proposedContent,
+              ...(changeRequest.proposedTitle && { title: changeRequest.proposedTitle }),
+              updatedAt: now,
             },
-          },
-        }),
+          }
+        ),
         // Update change request status
-        db.changeRequest.update({
-          where: { id: changeId },
-          data: { status, reviewNote },
-        }),
+        changeRequestsCol().updateOne(
+          { _id: changeOid },
+          { $set: { status, reviewNote: reviewNote ?? null, updatedAt: now } }
+        ),
       ]);
     } else {
       // Just update the change request status
-      await db.changeRequest.update({
-        where: { id: changeId },
-        data: { status, reviewNote },
-      });
+      await changeRequestsCol().updateOne(
+        { _id: changeOid },
+        { $set: { status, reviewNote: reviewNote ?? null, updatedAt: now } }
+      );
     }
 
     return NextResponse.json({ success: true, status });
@@ -181,35 +196,67 @@ export async function GET(
   try {
     const { id: promptId, changeId } = await params;
 
-    const changeRequest = await db.changeRequest.findUnique({
-      where: { id: changeId },
-      include: {
-        author: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-            avatar: true,
-          },
-        },
-        prompt: {
-          select: {
-            id: true,
-            title: true,
-            content: true,
-          },
-        },
-      },
-    });
-
-    if (!changeRequest || changeRequest.prompt.id !== promptId) {
+    let changeOid: ObjectId;
+    try {
+      changeOid = new ObjectId(changeId);
+    } catch {
       return NextResponse.json(
         { error: "not_found", message: "Change request not found" },
         { status: 404 }
       );
     }
 
-    return NextResponse.json(changeRequest);
+    const changeRequest = await changeRequestsCol().findOne({ _id: changeOid });
+
+    if (!changeRequest || changeRequest.promptId !== promptId) {
+      return NextResponse.json(
+        { error: "not_found", message: "Change request not found" },
+        { status: 404 }
+      );
+    }
+
+    // Fetch author
+    const author = await usersCol().findOne(
+      { _id: changeRequest.authorId as any },
+      { projection: { _id: 1, name: 1, username: 1, avatar: 1 } }
+    );
+
+    // Fetch prompt info
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Change request not found" },
+        { status: 404 }
+      );
+    }
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid },
+      { projection: { _id: 1, title: 1, content: 1 } }
+    );
+
+    const result = {
+      ...changeRequest,
+      id: changeRequest._id.toHexString(),
+      author: author
+        ? {
+            id: author._id.toHexString(),
+            name: author.name,
+            username: author.username,
+            avatar: author.avatar,
+          }
+        : null,
+      prompt: prompt
+        ? {
+            id: prompt._id.toHexString(),
+            title: prompt.title,
+            content: prompt.content,
+          }
+        : null,
+    };
+
+    return NextResponse.json(result);
   } catch (error) {
     console.error("Get change request error:", error);
     return NextResponse.json(
@@ -234,16 +281,21 @@ export async function DELETE(
 
     const { id: promptId, changeId } = await params;
 
+    let changeOid: ObjectId;
+    try {
+      changeOid = new ObjectId(changeId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Change request not found" },
+        { status: 404 }
+      );
+    }
+
     // Get change request
-    const changeRequest = await db.changeRequest.findUnique({
-      where: { id: changeId },
-      select: {
-        id: true,
-        promptId: true,
-        status: true,
-        authorId: true,
-      },
-    });
+    const changeRequest = await changeRequestsCol().findOne(
+      { _id: changeOid },
+      { projection: { promptId: 1, status: 1, authorId: 1 } }
+    );
 
     if (!changeRequest || changeRequest.promptId !== promptId) {
       return NextResponse.json(
@@ -269,9 +321,7 @@ export async function DELETE(
     }
 
     // Delete the change request
-    await db.changeRequest.delete({
-      where: { id: changeId },
-    });
+    await changeRequestsCol().deleteOne({ _id: changeOid });
 
     return NextResponse.json({ success: true });
   } catch (error) {

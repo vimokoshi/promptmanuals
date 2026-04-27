@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
-import { db } from "@/lib/db";
+import { ObjectId } from "mongodb";
+import { promptsCol } from "@/lib/mongodb";
 import { parseSkillFiles } from "@/lib/skill-files";
 import JSZip from "jszip";
 
@@ -9,7 +10,7 @@ import JSZip from "jszip";
  */
 function parseIdParam(idParam: string): string {
   let param = idParam;
-  
+
   // Remove .skill extension if present
   if (param.endsWith(".skill")) {
     param = param.slice(0, -".skill".length);
@@ -31,17 +32,18 @@ export async function GET(
   const { id: idParam } = await params;
   const id = parseIdParam(idParam);
 
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(id);
+  } catch {
+    return new Response("Skill not found", { status: 404 });
+  }
+
   // Fetch the skill
-  const prompt = await db.prompt.findFirst({
-    where: { id, deletedAt: null, isPrivate: false, type: "SKILL" },
-    select: { 
-      id: true,
-      slug: true,
-      title: true, 
-      description: true, 
-      content: true,
-    },
-  });
+  const prompt = await promptsCol().findOne(
+    { _id: oid, deletedAt: null, isPrivate: false, type: "SKILL" },
+    { projection: { slug: 1, title: 1, description: 1, content: 1 } }
+  );
 
   if (!prompt) {
     return new Response("Skill not found", { status: 404 });
@@ -59,7 +61,7 @@ export async function GET(
   }
 
   // Generate the zip content as blob for Response compatibility
-  const zipContent = await zip.generateAsync({ 
+  const zipContent = await zip.generateAsync({
     type: "blob",
     compression: "DEFLATE",
     compressionOptions: { level: 9 },

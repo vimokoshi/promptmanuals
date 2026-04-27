@@ -2,7 +2,7 @@ import Credentials from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
 import type { AuthPlugin } from "../types";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -25,9 +25,7 @@ export const credentialsPlugin: AuthPlugin = {
 
         const { email, password } = parsed.data;
 
-        const user = await db.user.findUnique({
-          where: { email },
-        });
+        const user = await usersCol().findOne({ email });
 
         if (!user || !user.password) return null;
 
@@ -35,7 +33,7 @@ export const credentialsPlugin: AuthPlugin = {
         if (!isValid) return null;
 
         return {
-          id: user.id,
+          id: user.id ?? user._id.toHexString(),
           email: user.email,
           name: user.name,
           image: user.avatar,

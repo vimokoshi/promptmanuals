@@ -1,14 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
 
 /**
  * Cron job endpoint to reset daily generation credits for all users.
  * Should be called daily via external cron service (e.g., Vercel Cron, GitHub Actions).
- * 
+ *
  * Requires CRON_SECRET environment variable for authentication.
- * 
+ *
  * Cron Notation: 0 0 * * * (Every day at midnight)
- * 
+ *
  * Example cron call:
  * curl -X POST https://your-domain.com/api/cron/reset-credits \
  *   -H "Authorization: Bearer YOUR_CRON_SECRET"
@@ -36,19 +36,26 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    // Reset generation credits for all users to their daily limit
-    const result = await db.$executeRaw`
-      UPDATE users 
-      SET "generationCreditsRemaining" = "dailyGenerationLimit",
-          "generationCreditsResetAt" = NOW()
-    `;
+    // Reset generationCreditsRemaining to each user's dailyGenerationLimit
+    const result = await usersCol().updateMany(
+      {},
+      [
+        {
+          $set: {
+            generationCreditsRemaining: "$dailyGenerationLimit",
+            generationCreditsResetAt: new Date(),
+          },
+        },
+      ]
+    );
 
-    console.log(`Daily credit reset completed. Updated ${result} users.`);
+    const usersUpdated = result.modifiedCount;
+    console.log(`Daily credit reset completed. Updated ${usersUpdated} users.`);
 
     return NextResponse.json({
       success: true,
       message: "Daily generation credits reset successfully",
-      usersUpdated: result,
+      usersUpdated,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {

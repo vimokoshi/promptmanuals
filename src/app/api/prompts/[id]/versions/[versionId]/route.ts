@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
 export async function DELETE(
   request: NextRequest,
@@ -17,11 +18,21 @@ export async function DELETE(
 
     const { id: promptId, versionId } = await params;
 
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
     // Check if prompt exists and user is owner
-    const prompt = await db.prompt.findUnique({
-      where: { id: promptId },
-      select: { authorId: true },
-    });
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid },
+      { projection: { authorId: 1, versions: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json(
@@ -37,23 +48,22 @@ export async function DELETE(
       );
     }
 
-    // Check if version exists
-    const version = await db.promptVersion.findUnique({
-      where: { id: versionId },
-      select: { id: true, promptId: true },
-    });
+    // Check if version exists in embedded array
+    const versions = prompt.versions ?? [];
+    const version = versions.find((v) => v._id === versionId);
 
-    if (!version || version.promptId !== promptId) {
+    if (!version) {
       return NextResponse.json(
         { error: "not_found", message: "Version not found" },
         { status: 404 }
       );
     }
 
-    // Delete the version
-    await db.promptVersion.delete({
-      where: { id: versionId },
-    });
+    // Pull version from embedded array
+    await promptsCol().updateOne(
+      { _id: promptOid },
+      { $pull: { versions: { _id: versionId } } as any }
+    );
 
     return NextResponse.json({ success: true });
   } catch (error) {

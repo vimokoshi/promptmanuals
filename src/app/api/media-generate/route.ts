@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import {
   getMediaGeneratorPlugin,
   getAvailableModels,
@@ -19,15 +20,17 @@ export async function GET() {
   const videoModels = getAvailableModels("video");
   const audioModels = getAvailableModels("audio");
 
-  // Get user's credit info
-  const user = await db.user.findUnique({
-    where: { id: session.user.id },
-    select: {
-      generationCreditsRemaining: true,
-      dailyGenerationLimit: true,
-      flagged: true,
-    },
-  });
+  let userOid: ObjectId;
+  try {
+    userOid = new ObjectId(session.user.id);
+  } catch {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const user = await usersCol().findOne(
+    { _id: userOid },
+    { projection: { generationCreditsRemaining: 1, dailyGenerationLimit: 1, flagged: 1 } }
+  );
 
   return NextResponse.json({
     available,
@@ -50,20 +53,22 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    // Check user's credits and flagged status
-    const user = await db.user.findUnique({
-      where: { id: session.user.id },
-      select: {
-        generationCreditsRemaining: true,
-        flagged: true,
-      },
-    });
+    let userOid: ObjectId;
+    try {
+      userOid = new ObjectId(session.user.id);
+    } catch {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const user = await usersCol().findOne(
+      { _id: userOid },
+      { projection: { generationCreditsRemaining: 1, flagged: 1 } }
+    );
 
     if (!user) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    // Block flagged users
     if (user.flagged) {
       return NextResponse.json(
         { error: "Your account has been flagged. Media generation is disabled." },
@@ -71,7 +76,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Check credits
     if (user.generationCreditsRemaining <= 0) {
       return NextResponse.json(
         { error: "No generation credits remaining. Credits reset daily." },
@@ -115,14 +119,10 @@ export async function POST(request: NextRequest) {
     });
 
     // Deduct one credit after successful generation start
-    await db.user.update({
-      where: { id: session.user.id },
-      data: {
-        generationCreditsRemaining: {
-          decrement: 1,
-        },
-      },
-    });
+    await usersCol().updateOne(
+      { _id: userOid },
+      { $inc: { generationCreditsRemaining: -1 } }
+    );
 
     return NextResponse.json({
       success: true,

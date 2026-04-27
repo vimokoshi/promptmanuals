@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
 // DELETE - Hard delete a prompt (admin only)
 export async function DELETE(
@@ -10,7 +11,6 @@ export async function DELETE(
   try {
     const session = await auth();
 
-    // Check if user is authenticated
     if (!session?.user) {
       return NextResponse.json(
         { error: "unauthorized", message: "Authentication required" },
@@ -18,7 +18,6 @@ export async function DELETE(
       );
     }
 
-    // Check if user is admin
     if (session.user.role !== "ADMIN") {
       return NextResponse.json(
         { error: "forbidden", message: "Admin access required" },
@@ -28,7 +27,6 @@ export async function DELETE(
 
     const { id } = await params;
 
-    // Validate prompt ID
     if (!id || typeof id !== "string") {
       return NextResponse.json(
         { error: "invalid_request", message: "Valid prompt ID is required" },
@@ -36,11 +34,20 @@ export async function DELETE(
       );
     }
 
-    // Check if prompt exists
-    const prompt = await db.prompt.findUnique({
-      where: { id },
-      select: { id: true, title: true },
-    });
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
+    const prompt = await promptsCol().findOne(
+      { _id: objectId },
+      { projection: { title: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json(
@@ -49,16 +56,13 @@ export async function DELETE(
       );
     }
 
-    // Hard delete the prompt (cascades to related records due to schema relations)
-    await db.prompt.delete({
-      where: { id },
-    });
+    await promptsCol().deleteOne({ _id: objectId });
 
     return NextResponse.json({
       success: true,
       message: "Prompt deleted successfully",
       deletedPrompt: {
-        id: prompt.id,
+        id: prompt._id.toHexString(),
         title: prompt.title,
       },
     });

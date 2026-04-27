@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
+import { ObjectId } from "mongodb";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
 
 // POST - Upvote a prompt
 export async function POST(
@@ -18,10 +19,22 @@ export async function POST(
 
     const { id: promptId } = await params;
 
-    // Check if prompt exists
-    const prompt = await db.prompt.findUnique({
-      where: { id: promptId },
-    });
+    let oid: ObjectId;
+    try {
+      oid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
+    const userId = session.user.id;
+
+    const prompt = await promptsCol().findOne(
+      { _id: oid },
+      { projection: { votes: 1, voteCount: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json(
@@ -30,37 +43,29 @@ export async function POST(
       );
     }
 
-    // Check if already voted
-    const existing = await db.promptVote.findUnique({
-      where: {
-        userId_promptId: {
-          userId: session.user.id,
-          promptId,
-        },
-      },
-    });
+    const hasVoted = prompt.votes?.some((v) => v.userId === userId);
 
-    if (existing) {
+    if (hasVoted) {
       return NextResponse.json(
         { error: "already_voted", message: "You have already upvoted this prompt" },
         { status: 400 }
       );
     }
 
-    // Create vote
-    await db.promptVote.create({
-      data: {
-        userId: session.user.id,
-        promptId,
-      },
-    });
+    await promptsCol().updateOne(
+      { _id: oid },
+      {
+        $push: { votes: { userId, createdAt: new Date() } } as any,
+        $inc: { voteCount: 1 },
+      }
+    );
 
-    // Get updated vote count
-    const voteCount = await db.promptVote.count({
-      where: { promptId },
-    });
+    const updated = await promptsCol().findOne(
+      { _id: oid },
+      { projection: { voteCount: 1 } }
+    );
 
-    return NextResponse.json({ voted: true, voteCount });
+    return NextResponse.json({ voted: true, voteCount: updated?.voteCount ?? 0 });
   } catch (error) {
     console.error("Vote error:", error);
     return NextResponse.json(
@@ -86,20 +91,32 @@ export async function DELETE(
 
     const { id: promptId } = await params;
 
-    // Delete vote
-    await db.promptVote.deleteMany({
-      where: {
-        userId: session.user.id,
-        promptId,
-      },
-    });
+    let oid: ObjectId;
+    try {
+      oid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
 
-    // Get updated vote count
-    const voteCount = await db.promptVote.count({
-      where: { promptId },
-    });
+    const userId = session.user.id;
 
-    return NextResponse.json({ voted: false, voteCount });
+    await promptsCol().updateOne(
+      { _id: oid },
+      {
+        $pull: { votes: { userId } } as any,
+        $inc: { voteCount: -1 },
+      }
+    );
+
+    const updated = await promptsCol().findOne(
+      { _id: oid },
+      { projection: { voteCount: 1 } }
+    );
+
+    return NextResponse.json({ voted: false, voteCount: updated?.voteCount ?? 0 });
   } catch (error) {
     console.error("Unvote error:", error);
     return NextResponse.json(

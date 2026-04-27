@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { tagsCol, promptsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
 // Update tag
 export async function PATCH(
@@ -14,19 +15,33 @@ export async function PATCH(
     }
 
     const { id } = await params;
+
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "Tag not found" }, { status: 404 });
+    }
+
     const body = await request.json();
     const { name, slug, color } = body;
 
-    const tag = await db.tag.update({
-      where: { id },
-      data: {
-        ...(name && { name }),
-        ...(slug && { slug }),
-        ...(color && { color }),
-      },
-    });
+    const setFields: Record<string, unknown> = {};
+    if (name) setFields.name = name;
+    if (slug) setFields.slug = slug;
+    if (color) setFields.color = color;
 
-    return NextResponse.json(tag);
+    const updated = await tagsCol().findOneAndUpdate(
+      { _id: objectId },
+      { $set: setFields },
+      { returnDocument: "after" }
+    );
+
+    if (!updated) {
+      return NextResponse.json({ error: "Tag not found" }, { status: 404 });
+    }
+
+    return NextResponse.json({ ...updated, id: updated._id.toHexString() });
   } catch (error) {
     console.error("Error updating tag:", error);
     return NextResponse.json({ error: "Failed to update tag" }, { status: 500 });
@@ -46,9 +61,24 @@ export async function DELETE(
 
     const { id } = await params;
 
-    await db.tag.delete({
-      where: { id },
-    });
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "Tag not found" }, { status: 404 });
+    }
+
+    const result = await tagsCol().deleteOne({ _id: objectId });
+
+    if (result.deletedCount === 0) {
+      return NextResponse.json({ error: "Tag not found" }, { status: 404 });
+    }
+
+    // Remove this tag from all prompts that embed it
+    await promptsCol().updateMany(
+      { "tags._id": id },
+      { $pull: { tags: { _id: id } } as never }
+    );
 
     return NextResponse.json({ success: true });
   } catch (error) {

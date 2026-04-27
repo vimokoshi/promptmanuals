@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { webhookConfigsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import { isPrivateUrl } from "@/lib/webhook";
 
 export async function POST(
@@ -15,10 +16,14 @@ export async function POST(
 
     const { id } = await params;
 
-    // Get the webhook configuration
-    const webhook = await db.webhookConfig.findUnique({
-      where: { id },
-    });
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "Webhook not found" }, { status: 404 });
+    }
+
+    const webhook = await webhookConfigsCol().findOne({ _id: objectId });
 
     if (!webhook) {
       return NextResponse.json({ error: "Webhook not found" }, { status: 404 });
@@ -56,7 +61,6 @@ export async function POST(
       payload = payload.replaceAll(placeholder, value);
     }
 
-    // Parse the payload as JSON
     let parsedPayload;
     try {
       parsedPayload = JSON.parse(payload);
@@ -75,7 +79,6 @@ export async function POST(
       );
     }
 
-    // Send the test request
     const response = await fetch(webhook.url, {
       method: webhook.method,
       headers: {

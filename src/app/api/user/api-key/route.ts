@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import { generateApiKey } from "@/lib/api-key";
 
 export const runtime = "nodejs";
@@ -12,13 +13,17 @@ export async function GET() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const user = await db.user.findUnique({
-    where: { id: session.user.id },
-    select: {
-      apiKey: true,
-      mcpPromptsPublicByDefault: true,
-    },
-  });
+  let userId: ObjectId;
+  try {
+    userId = new ObjectId(session.user.id);
+  } catch {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const user = await usersCol().findOne(
+    { _id: userId },
+    { projection: { apiKey: 1, mcpPromptsPublicByDefault: 1 } }
+  );
 
   if (!user) {
     return NextResponse.json({ error: "User not found" }, { status: 404 });
@@ -38,12 +43,19 @@ export async function POST() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  let userId: ObjectId;
+  try {
+    userId = new ObjectId(session.user.id);
+  } catch {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const apiKey = generateApiKey();
 
-  await db.user.update({
-    where: { id: session.user.id },
-    data: { apiKey },
-  });
+  await usersCol().findOneAndUpdate(
+    { _id: userId },
+    { $set: { apiKey, updatedAt: new Date() } }
+  );
 
   return NextResponse.json({ apiKey });
 }
@@ -55,10 +67,17 @@ export async function DELETE() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  await db.user.update({
-    where: { id: session.user.id },
-    data: { apiKey: null },
-  });
+  let userId: ObjectId;
+  try {
+    userId = new ObjectId(session.user.id);
+  } catch {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  await usersCol().findOneAndUpdate(
+    { _id: userId },
+    { $set: { apiKey: null, updatedAt: new Date() } }
+  );
 
   return NextResponse.json({ success: true });
 }
@@ -70,6 +89,13 @@ export async function PATCH(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  let userId: ObjectId;
+  try {
+    userId = new ObjectId(session.user.id);
+  } catch {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const body = await request.json();
   const { mcpPromptsPublicByDefault } = body;
 
@@ -77,10 +103,10 @@ export async function PATCH(request: Request) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
-  await db.user.update({
-    where: { id: session.user.id },
-    data: { mcpPromptsPublicByDefault },
-  });
+  await usersCol().findOneAndUpdate(
+    { _id: userId },
+    { $set: { mcpPromptsPublicByDefault, updatedAt: new Date() } }
+  );
 
   return NextResponse.json({ success: true });
 }

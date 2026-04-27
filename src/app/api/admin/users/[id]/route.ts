@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
-// Update user (role change or verification)
+// Update user (role change, verification, flagging, generation limits)
 export async function PATCH(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -14,73 +15,75 @@ export async function PATCH(
     }
 
     const { id } = await params;
+
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    }
+
     const body = await request.json();
     const { role, verified, flagged, flaggedReason, dailyGenerationLimit } = body;
 
-    // Build update data
-    const updateData: { 
-      role?: "ADMIN" | "USER"; 
-      verified?: boolean;
-      flagged?: boolean;
-      flaggedAt?: Date | null;
-      flaggedReason?: string | null;
-      dailyGenerationLimit?: number;
-      generationCreditsRemaining?: number;
-    } = {};
+    const setFields: Record<string, unknown> = { updatedAt: new Date() };
 
     if (role !== undefined) {
       if (!["ADMIN", "USER"].includes(role)) {
         return NextResponse.json({ error: "Invalid role" }, { status: 400 });
       }
-      updateData.role = role;
+      setFields.role = role;
     }
 
     if (verified !== undefined) {
-      updateData.verified = verified;
+      setFields.verified = verified;
     }
 
     if (flagged !== undefined) {
-      updateData.flagged = flagged;
+      setFields.flagged = flagged;
       if (flagged) {
-        updateData.flaggedAt = new Date();
-        updateData.flaggedReason = flaggedReason || null;
+        setFields.flaggedAt = new Date();
+        setFields.flaggedReason = flaggedReason || null;
       } else {
-        updateData.flaggedAt = null;
-        updateData.flaggedReason = null;
+        setFields.flaggedAt = null;
+        setFields.flaggedReason = null;
       }
     }
 
     if (dailyGenerationLimit !== undefined) {
-      const limit = parseInt(dailyGenerationLimit, 10);
-      if (isNaN(limit) || limit < 0) {
+      const lim = parseInt(dailyGenerationLimit, 10);
+      if (isNaN(lim) || lim < 0) {
         return NextResponse.json({ error: "Invalid daily generation limit" }, { status: 400 });
       }
-      updateData.dailyGenerationLimit = limit;
-      // Also reset remaining credits to the new limit
-      updateData.generationCreditsRemaining = limit;
+      setFields.dailyGenerationLimit = lim;
+      setFields.generationCreditsRemaining = lim;
     }
 
-    const user = await db.user.update({
-      where: { id },
-      data: updateData,
-      select: {
-        id: true,
-        email: true,
-        username: true,
-        name: true,
-        avatar: true,
-        role: true,
-        verified: true,
-        flagged: true,
-        flaggedAt: true,
-        flaggedReason: true,
-        dailyGenerationLimit: true,
-        generationCreditsRemaining: true,
-        createdAt: true,
-      },
-    });
+    const updated = await usersCol().findOneAndUpdate(
+      { _id: objectId },
+      { $set: setFields },
+      { returnDocument: "after" }
+    );
 
-    return NextResponse.json(user);
+    if (!updated) {
+      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    }
+
+    return NextResponse.json({
+      id: updated._id.toHexString(),
+      email: updated.email,
+      username: updated.username,
+      name: updated.name,
+      avatar: updated.avatar,
+      role: updated.role,
+      verified: updated.verified,
+      flagged: updated.flagged,
+      flaggedAt: updated.flaggedAt,
+      flaggedReason: updated.flaggedReason,
+      dailyGenerationLimit: updated.dailyGenerationLimit,
+      generationCreditsRemaining: updated.generationCreditsRemaining,
+      createdAt: updated.createdAt,
+    });
   } catch (error) {
     console.error("Error updating user:", error);
     return NextResponse.json({ error: "Failed to update user" }, { status: 500 });
@@ -105,9 +108,18 @@ export async function DELETE(
       return NextResponse.json({ error: "Cannot delete yourself" }, { status: 400 });
     }
 
-    await db.user.delete({
-      where: { id },
-    });
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    }
+
+    const result = await usersCol().deleteOne({ _id: objectId });
+
+    if (result.deletedCount === 0) {
+      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    }
 
     return NextResponse.json({ success: true });
   } catch (error) {

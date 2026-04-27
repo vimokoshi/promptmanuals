@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { commentsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import { getConfig } from "@/lib/config";
 import { z } from "zod";
 
@@ -44,12 +45,22 @@ export async function POST(
     }
 
     const { value } = validation.data;
+    const userId = session.user.id;
 
-    // Check if comment exists
-    const comment = await db.comment.findUnique({
-      where: { id: commentId, deletedAt: null },
-      select: { id: true, promptId: true },
-    });
+    let commentOid: ObjectId;
+    try {
+      commentOid = new ObjectId(commentId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Comment not found" },
+        { status: 404 }
+      );
+    }
+
+    const comment = await commentsCol().findOne(
+      { _id: commentOid, deletedAt: null },
+      { projection: { _id: 1, promptId: 1, votes: 1, score: 1 } }
+    );
 
     if (!comment || comment.promptId !== promptId) {
       return NextResponse.json(
@@ -58,77 +69,61 @@ export async function POST(
       );
     }
 
-    // Check if user already voted
-    const existingVote = await db.commentVote.findUnique({
-      where: {
-        userId_commentId: {
-          userId: session.user.id,
-          commentId,
-        },
-      },
-    });
+    const votes = comment.votes ?? [];
+    const existingVote = votes.find((v) => v.userId === userId);
 
     if (existingVote) {
       if (existingVote.value === value) {
-        // Same vote - remove it (toggle off)
-        await db.commentVote.delete({
-          where: {
-            userId_commentId: {
-              userId: session.user.id,
-              commentId,
-            },
-          },
-        });
+        // Same vote — toggle off (remove)
+        await commentsCol().updateOne(
+          { _id: commentOid },
+          {
+            $pull: { votes: { userId } } as any,
+            $inc: { score: -existingVote.value },
+            $set: { updatedAt: new Date() },
+          }
+        );
       } else {
-        // Different vote - update it
-        await db.commentVote.update({
-          where: {
-            userId_commentId: {
-              userId: session.user.id,
-              commentId,
-            },
-          },
-          data: { value },
-        });
+        // Different vote — replace
+        await commentsCol().updateOne(
+          { _id: commentOid },
+          {
+            $pull: { votes: { userId } } as any,
+            $inc: { score: value - existingVote.value },
+            $set: { updatedAt: new Date() },
+          }
+        );
+        await commentsCol().updateOne(
+          { _id: commentOid },
+          {
+            $push: { votes: { userId, value, createdAt: new Date() } } as any,
+          }
+        );
       }
     } else {
-      // No existing vote - create one
-      await db.commentVote.create({
-        data: {
-          userId: session.user.id,
-          commentId,
-          value,
-        },
-      });
+      // No existing vote — add
+      await commentsCol().updateOne(
+        { _id: commentOid },
+        {
+          $push: { votes: { userId, value, createdAt: new Date() } } as any,
+          $inc: { score: value },
+          $set: { updatedAt: new Date() },
+        }
+      );
     }
 
-    // Calculate and update cached score
-    const votes = await db.commentVote.findMany({
-      where: { commentId },
-      select: { value: true },
-    });
-    const score = votes.reduce((sum: number, vote: { value: number }) => sum + vote.value, 0);
+    // Re-fetch updated comment to return accurate score and userVote
+    const updated = await commentsCol().findOne(
+      { _id: commentOid },
+      { projection: { score: 1, votes: 1 } }
+    );
 
-    // Update cached score in comment
-    await db.comment.update({
-      where: { id: commentId },
-      data: { score },
-    });
+    const userVote =
+      updated?.votes?.find((v) => v.userId === userId)?.value ?? 0;
 
-    // Get user's current vote
-    const userVote = await db.commentVote.findUnique({
-      where: {
-        userId_commentId: {
-          userId: session.user.id,
-          commentId,
-        },
-      },
-      select: { value: true },
-    });
-
-    return NextResponse.json({ 
-      score, 
-      userVote: userVote?.value ?? 0,
+    return NextResponse.json({
+      score: updated?.score ?? 0,
+      userVote,
     });
   } catch (error) {
     console.error("Vote comment error:", error);
@@ -162,29 +157,41 @@ export async function DELETE(
     }
 
     const { commentId } = await params;
+    const userId = session.user.id;
 
-    // Delete vote
-    await db.commentVote.deleteMany({
-      where: {
-        userId: session.user.id,
-        commentId,
-      },
-    });
+    let commentOid: ObjectId;
+    try {
+      commentOid = new ObjectId(commentId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Comment not found" },
+        { status: 404 }
+      );
+    }
 
-    // Calculate and update cached score
-    const votes = await db.commentVote.findMany({
-      where: { commentId },
-      select: { value: true },
-    });
-    const score = votes.reduce((sum: number, vote: { value: number }) => sum + vote.value, 0);
+    const comment = await commentsCol().findOne(
+      { _id: commentOid },
+      { projection: { votes: 1 } }
+    );
 
-    // Update cached score in comment
-    await db.comment.update({
-      where: { id: commentId },
-      data: { score },
-    });
+    const existingVote = comment?.votes?.find((v) => v.userId === userId);
+    const scoreAdj = existingVote ? -existingVote.value : 0;
 
-    return NextResponse.json({ score, userVote: 0 });
+    await commentsCol().updateOne(
+      { _id: commentOid },
+      {
+        $pull: { votes: { userId } } as any,
+        $inc: { score: scoreAdj },
+        $set: { updatedAt: new Date() },
+      }
+    );
+
+    const updated = await commentsCol().findOne(
+      { _id: commentOid },
+      { projection: { score: 1 } }
+    );
+
+    return NextResponse.json({ score: updated?.score ?? 0, userVote: 0 });
   } catch (error) {
     console.error("Unvote comment error:", error);
     return NextResponse.json(

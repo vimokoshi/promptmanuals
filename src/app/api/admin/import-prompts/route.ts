@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, usersCol, categoriesCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
+import type { PromptDocument, EmbeddedTag } from "@/lib/mongodb";
 import fs from "fs/promises";
 import path from "path";
 
@@ -27,17 +29,15 @@ function parseCSV(content: string): CsvRow[] {
   let current = "";
   let inQuotes = false;
   let isFirstRow = true;
-  
-  // Parse character by character to handle multi-line quoted fields
+
   for (let i = 0; i < content.length; i++) {
     const char = content[i];
     const nextChar = content[i + 1];
-    
+
     if (char === '"' && !inQuotes) {
       inQuotes = true;
     } else if (char === '"' && inQuotes) {
       if (nextChar === '"') {
-        // Escaped quote ""
         current += '"';
         i++;
       } else {
@@ -47,17 +47,13 @@ function parseCSV(content: string): CsvRow[] {
       values.push(current);
       current = "";
     } else if ((char === '\n' || (char === '\r' && nextChar === '\n')) && !inQuotes) {
-      // End of row (not inside quotes)
-      if (char === '\r') i++; // Skip \r in \r\n
-      
+      if (char === '\r') i++;
       values.push(current);
       current = "";
-      
+
       if (isFirstRow) {
-        // Skip header row
         isFirstRow = false;
       } else if (values.some(v => v.trim())) {
-        // Only add non-empty rows
         rows.push({
           act: values[0]?.trim() || "",
           prompt: unescapeString(values[1] || ""),
@@ -66,13 +62,12 @@ function parseCSV(content: string): CsvRow[] {
           contributor: values[4]?.trim() || "",
         });
       }
-      values.length = 0; // Clear array
+      values.length = 0;
     } else {
       current += char;
     }
   }
-  
-  // Handle last row if file doesn't end with newline
+
   if (current || values.length > 0) {
     values.push(current);
     if (!isFirstRow && values.some(v => v.trim())) {
@@ -85,11 +80,14 @@ function parseCSV(content: string): CsvRow[] {
       });
     }
   }
-  
+
   return rows;
 }
 
-function mapCsvTypeToPromptType(csvType: string): { type: "TEXT" | "IMAGE" | "VIDEO" | "AUDIO" | "STRUCTURED"; structuredFormat: "JSON" | "YAML" | null } {
+function mapCsvTypeToPromptType(csvType: string): {
+  type: "TEXT" | "IMAGE" | "VIDEO" | "AUDIO" | "STRUCTURED";
+  structuredFormat: "JSON" | "YAML" | null;
+} {
   const type = csvType.toUpperCase();
   if (type === "JSON") return { type: "STRUCTURED", structuredFormat: "JSON" };
   if (type === "YAML") return { type: "STRUCTURED", structuredFormat: "YAML" };
@@ -107,85 +105,93 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Read the prompts.csv file from the project root
     const csvPath = path.join(process.cwd(), "prompts.csv");
     const csvContent = await fs.readFile(csvPath, "utf-8");
-    
     const rows = parseCSV(csvContent);
-    
+
     if (rows.length === 0) {
       return NextResponse.json({ error: "No valid rows found in CSV" }, { status: 400 });
     }
 
-    // Get the admin user ID for fallback author assignment
     const adminUserId = session.user.id;
 
     // Upsert "Coding" category for for_devs prompts
-    const codingCategory = await db.category.upsert({
-      where: { slug: "coding" },
-      update: {},
-      create: {
+    const codingCategorySlug = "coding";
+    let codingCategory = await categoriesCol().findOne({ slug: codingCategorySlug });
+    if (!codingCategory) {
+      const insertResult = await categoriesCol().insertOne({
+        _id: new ObjectId(),
         name: "Coding",
-        slug: "coding",
+        slug: codingCategorySlug,
         description: "Programming and development prompts",
         icon: "💻",
-      },
-    });
+        order: 0,
+        pinned: false,
+        parentId: null,
+      });
+      codingCategory = await categoriesCol().findOne({ _id: insertResult.insertedId });
+    }
+    const codingCategoryId = codingCategory!._id.toHexString();
 
-    // Cache for contributor users (username -> userId)
+    // Cache for contributor users (username -> userId string)
     const contributorCache = new Map<string, string>();
 
-    // Helper to get or create contributor user
     async function getOrCreateContributorUser(username: string): Promise<string> {
       const normalizedUsername = username.toLowerCase().trim();
-      
-      // Check cache first
       if (contributorCache.has(normalizedUsername)) {
         return contributorCache.get(normalizedUsername)!;
       }
 
-      // Check if user exists by username or pseudo email
       const pseudoEmail = `${normalizedUsername}@unclaimed.prompts.chat`;
-      
-      let user = await db.user.findFirst({
-        where: {
-          OR: [
-            { username: normalizedUsername },
-            { email: pseudoEmail },
-          ],
-        },
+
+      let user = await usersCol().findOne({
+        $or: [{ username: normalizedUsername }, { email: pseudoEmail }],
       });
 
       if (!user) {
-        // Create pseudo user - they can claim this account later by logging in with GitHub
-        user = await db.user.create({
-          data: {
-            username: normalizedUsername,
-            email: pseudoEmail,
-            name: normalizedUsername,
-            role: "USER",
-          },
+        const now = new Date();
+        const insertResult = await usersCol().insertOne({
+          _id: new ObjectId(),
+          username: normalizedUsername,
+          email: pseudoEmail,
+          name: normalizedUsername,
+          password: null,
+          avatar: null,
+          bio: null,
+          customLinks: null,
+          role: "USER",
+          locale: "en",
+          emailVerified: null,
+          createdAt: now,
+          updatedAt: now,
+          verified: false,
+          githubUsername: null,
+          apiKey: null,
+          mcpPromptsPublicByDefault: false,
+          flagged: false,
+          flaggedAt: null,
+          flaggedReason: null,
+          dailyGenerationLimit: 10,
+          generationCreditsRemaining: 10,
+          generationCreditsResetAt: null,
         });
+        const userId = insertResult.insertedId.toHexString();
+        contributorCache.set(normalizedUsername, userId);
+        return userId;
       }
 
-      contributorCache.set(normalizedUsername, user.id);
-      return user.id;
+      const userId = user._id.toHexString();
+      contributorCache.set(normalizedUsername, userId);
+      return userId;
     }
 
-    // Handle multiple contributors (comma-separated), return first as primary author
     async function getOrCreateContributor(contributorField: string): Promise<string> {
       if (!contributorField) return adminUserId;
-      
-      // Split by comma for multiple contributors
       const contributors = contributorField.split(',').map(c => c.trim()).filter(Boolean);
-      
       if (contributors.length === 0) return adminUserId;
-      
-      // Create users for all contributors, return first as primary author
       for (const username of contributors) {
         await getOrCreateContributorUser(username);
       }
-      
       return contributorCache.get(contributors[0].toLowerCase())!;
     }
 
@@ -195,50 +201,69 @@ export async function POST(request: NextRequest) {
 
     for (const row of rows) {
       try {
-        // Check if prompt with same title already exists
-        const existing = await db.prompt.findFirst({
-          where: { title: row.act },
-        });
-
+        const existing = await promptsCol().findOne({ title: row.act }, { projection: { _id: 1 } });
         if (existing) {
           skipped++;
           continue;
         }
 
-        // Get or create contributor user
         const authorId = await getOrCreateContributor(row.contributor);
-
-        // Determine type and structured format
         const { type, structuredFormat } = mapCsvTypeToPromptType(row.type);
-        
-        // Determine category based on for_devs field
         const isForDevs = row.for_devs.toUpperCase() === "TRUE";
-        const categoryId = isForDevs ? codingCategory.id : null;
+        const categoryId = isForDevs ? codingCategoryId : null;
 
-        // Create the prompt
-        const prompt = await db.prompt.create({
-          data: {
-            title: row.act,
-            content: row.prompt,
-            type,
-            structuredFormat,
-            isPrivate: false,
-            authorId,
-            categoryId,
-          },
-        });
+        const now = new Date();
+        const promptId = new ObjectId();
+        const versionId = new ObjectId().toHexString();
 
-        // Create initial version
-        await db.promptVersion.create({
-          data: {
-            promptId: prompt.id,
-            version: 1,
-            content: row.prompt,
-            changeNote: "Imported from prompts.csv",
-            createdBy: authorId,
-          },
-        });
+        const doc: PromptDocument = {
+          _id: promptId,
+          title: row.act,
+          slug: null,
+          description: null,
+          content: row.prompt,
+          type,
+          structuredFormat: structuredFormat ?? null,
+          isPrivate: false,
+          mediaUrl: null,
+          viewCount: 0,
+          createdAt: now,
+          updatedAt: now,
+          authorId,
+          categoryId,
+          embedding: null,
+          requiredMediaCount: null,
+          requiredMediaType: null,
+          requiresMediaUpload: false,
+          featuredAt: null,
+          isFeatured: false,
+          isUnlisted: false,
+          unlistedAt: null,
+          delistReason: null,
+          deletedAt: null,
+          tags: [] as EmbeddedTag[],
+          voteCount: 0,
+          votes: [],
+          versions: [
+            {
+              _id: versionId,
+              version: 1,
+              content: row.prompt,
+              changeNote: "Imported from prompts.csv",
+              createdAt: now,
+              createdBy: authorId,
+            },
+          ],
+          userExamples: [],
+          reports: [],
+          bestWithModels: [],
+          bestWithMCP: null,
+          workflowLink: null,
+          translations: null,
+          seoMeta: null,
+        };
 
+        await promptsCol().insertOne(doc);
         imported++;
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : "Unknown error";
@@ -251,7 +276,7 @@ export async function POST(request: NextRequest) {
       imported,
       skipped,
       total: rows.length,
-      errors: errors.slice(0, 10), // Only return first 10 errors
+      errors: errors.slice(0, 10),
     });
   } catch (error) {
     console.error("Error importing prompts:", error);
@@ -270,31 +295,21 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Read CSV to get the titles of community prompts
     const csvPath = path.join(process.cwd(), "prompts.csv");
     const csvContent = await fs.readFile(csvPath, "utf-8");
     const rows = parseCSV(csvContent);
-    
     const titles = rows.map(row => row.act);
-    
-    // Delete all prompts that match the CSV titles
-    const result = await db.prompt.deleteMany({
-      where: {
-        title: { in: titles },
-      },
-    });
 
-    // Delete all unclaimed users (users with @unclaimed.prompts.chat emails)
-    const deletedUsers = await db.user.deleteMany({
-      where: {
-        email: { endsWith: "@unclaimed.prompts.chat" },
-      },
+    const deleteResult = await promptsCol().deleteMany({ title: { $in: titles } });
+
+    const deleteUsersResult = await usersCol().deleteMany({
+      email: { $regex: /@unclaimed\.prompts\.chat$/ },
     });
 
     return NextResponse.json({
       success: true,
-      deleted: result.count,
-      deletedUsers: deletedUsers.count,
+      deleted: deleteResult.deletedCount,
+      deletedUsers: deleteUsersResult.deletedCount,
     });
   } catch (error) {
     console.error("Error deleting community prompts:", error);

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { improvePrompt } from "@/lib/ai/improve-prompt";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
 import { isValidApiKeyFormat } from "@/lib/api-key";
 import { auth } from "@/lib/auth";
 
@@ -19,25 +19,27 @@ async function authenticateRequest(request: NextRequest) {
   }
 
   // Fall back to API key auth
-  const apiKey = request.headers.get("x-api-key") || 
-                 request.headers.get("authorization")?.replace("Bearer ", "") ||
-                 request.headers.get("prompts-api-key");
+  const apiKey =
+    request.headers.get("x-api-key") ||
+    request.headers.get("authorization")?.replace("Bearer ", "") ||
+    request.headers.get("prompts-api-key");
 
   if (!apiKey || !isValidApiKeyFormat(apiKey)) {
     return null;
   }
 
-  const user = await db.user.findUnique({
-    where: { apiKey },
-    select: { id: true, username: true },
-  });
+  const user = await usersCol().findOne(
+    { apiKey },
+    { projection: { _id: 1, username: 1 } }
+  );
 
-  return user;
+  if (!user) return null;
+
+  return { id: user._id.toHexString(), username: user.username ?? "user" };
 }
 
 export async function POST(request: NextRequest) {
   try {
-    // Authenticate request (session or API key)
     const user = await authenticateRequest(request);
     if (!user) {
       return NextResponse.json(
@@ -65,7 +67,6 @@ export async function POST(request: NextRequest) {
     console.error("Error improving prompt:", error);
 
     if (error instanceof Error) {
-      // Handle rate limiting
       if (error.message.includes("rate limit")) {
         return NextResponse.json(
           { error: "Rate limit exceeded. Please try again later." },

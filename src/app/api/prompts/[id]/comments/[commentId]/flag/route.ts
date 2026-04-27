@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { commentsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import { getConfig } from "@/lib/config";
 
 // POST - Flag a comment (admin only)
@@ -34,11 +35,20 @@ export async function POST(
 
     const { id: promptId, commentId } = await params;
 
-    // Check if comment exists
-    const comment = await db.comment.findUnique({
-      where: { id: commentId, deletedAt: null },
-      select: { id: true, promptId: true, flagged: true },
-    });
+    let commentOid: ObjectId;
+    try {
+      commentOid = new ObjectId(commentId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Comment not found" },
+        { status: 404 }
+      );
+    }
+
+    const comment = await commentsCol().findOne(
+      { _id: commentOid, deletedAt: null },
+      { projection: { _id: 1, promptId: 1, flagged: 1 } }
+    );
 
     if (!comment || comment.promptId !== promptId) {
       return NextResponse.json(
@@ -47,19 +57,21 @@ export async function POST(
       );
     }
 
-    // Toggle flagged status
-    const updated = await db.comment.update({
-      where: { id: commentId },
-      data: { 
-        flagged: !comment.flagged,
-        flaggedAt: !comment.flagged ? new Date() : null,
-        flaggedBy: !comment.flagged ? session.user.id : null,
-      },
-    });
+    const newFlagged = !comment.flagged;
 
-    return NextResponse.json({ 
-      flagged: updated.flagged,
-    });
+    await commentsCol().updateOne(
+      { _id: commentOid },
+      {
+        $set: {
+          flagged: newFlagged,
+          flaggedAt: newFlagged ? new Date() : null,
+          flaggedBy: newFlagged ? session.user.id : null,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    return NextResponse.json({ flagged: newFlagged });
   } catch (error) {
     console.error("Flag comment error:", error);
     return NextResponse.json(

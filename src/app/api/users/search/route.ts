@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
 
 export async function GET(request: Request) {
   try {
     const session = await auth();
-    
+
     if (!session?.user) {
       return NextResponse.json(
         { error: "unauthorized", message: "You must be logged in" },
@@ -20,24 +20,28 @@ export async function GET(request: Request) {
       return NextResponse.json([]);
     }
 
-    const users = await db.user.findMany({
-      where: {
-        OR: [
-          { username: { contains: query, mode: "insensitive" } },
-          { name: { contains: query, mode: "insensitive" } },
-        ],
-      },
-      select: {
-        id: true,
-        username: true,
-        name: true,
-        avatar: true,
-      },
-      take: 10,
-      orderBy: { username: "asc" },
-    });
+    const users = await usersCol()
+      .find(
+        {
+          $or: [
+            { username: { $regex: query, $options: "i" } },
+            { name: { $regex: query, $options: "i" } },
+          ],
+        },
+        { projection: { _id: 1, username: 1, name: 1, avatar: 1 } }
+      )
+      .sort({ username: 1 })
+      .limit(10)
+      .toArray();
 
-    return NextResponse.json(users);
+    return NextResponse.json(
+      users.map((u) => ({
+        id: u._id.toHexString(),
+        username: u.username,
+        name: u.name,
+        avatar: u.avatar,
+      }))
+    );
   } catch (error) {
     console.error("User search error:", error);
     return NextResponse.json(

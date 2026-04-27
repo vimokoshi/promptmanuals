@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { unstable_cache } from "next/cache";
-import { db } from "@/lib/db";
+import { promptsCol, usersCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
 // Cache leaderboard data for 1 hour (3600 seconds)
 const getLeaderboard = unstable_cache(
@@ -15,128 +16,147 @@ const getLeaderboard = unstable_cache(
       dateFilter = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
     }
 
-    // Use database aggregation instead of loading all data into memory
-    // Group votes by prompt author to get total upvotes per user
-    const votesByAuthor = await db.promptVote.groupBy({
-      by: ["promptId"],
-      where: dateFilter ? { createdAt: { gte: dateFilter } } : undefined,
-      _count: { promptId: true },
-    });
-
-    // Get prompt author mapping for voted prompts only
-    const votedPromptIds = votesByAuthor.map((v) => v.promptId);
-    const promptAuthors = await db.prompt.findMany({
-      where: {
-        id: { in: votedPromptIds },
-        isPrivate: false,
-        deletedAt: null,
-      },
-      select: {
-        id: true,
-        authorId: true,
-      },
-    });
-
-    const promptToAuthor = new Map(promptAuthors.map((p) => [p.id, p.authorId]));
-
-    // Aggregate votes by author
-    const authorVoteCounts = new Map<string, number>();
-    for (const vote of votesByAuthor) {
-      const authorId = promptToAuthor.get(vote.promptId);
-      if (authorId) {
-        authorVoteCounts.set(authorId, (authorVoteCounts.get(authorId) || 0) + vote._count.promptId);
-      }
-    }
-
-    // Get top 50 users by vote count
-    const topAuthorIds = Array.from(authorVoteCounts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 50)
-      .map(([id]) => id);
-
-    // Fetch user details and prompt counts for top users
-    const topUsers = await db.user.findMany({
-      where: { id: { in: topAuthorIds } },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        avatar: true,
-        _count: {
-          select: {
-            prompts: {
-              where: {
-                isPrivate: false,
-                deletedAt: null,
-              },
-            },
-          },
+    // Aggregate vote counts per prompt author using embedded votes array
+    // votes[] is an array of { userId, createdAt } embedded on each prompt
+    const voteAggPipeline: object[] = [
+      {
+        $match: {
+          isPrivate: false,
+          deletedAt: null,
+          ...(dateFilter ? { "votes.createdAt": { $gte: dateFilter } } : {}),
         },
       },
-    });
+      { $unwind: { path: "$votes", preserveNullAndEmpty: false } },
+      ...(dateFilter
+        ? [{ $match: { "votes.createdAt": { $gte: dateFilter } } }]
+        : []),
+      {
+        $group: {
+          _id: "$authorId",
+          totalUpvotes: { $sum: 1 },
+        },
+      },
+      { $sort: { totalUpvotes: -1 } },
+      { $limit: 50 },
+    ];
 
-    // Build leaderboard with vote counts
+    const votesPerAuthor = await promptsCol()
+      .aggregate<{ _id: string; totalUpvotes: number }>(voteAggPipeline)
+      .toArray();
+
+    const topAuthorIds = votesPerAuthor.map((v) => v._id);
+
+    // Map authorId → totalUpvotes
+    const authorVoteCounts = new Map<string, number>(
+      votesPerAuthor.map((v) => [v._id, v.totalUpvotes])
+    );
+
+    // Fetch prompt counts for top authors
+    const promptCountPipeline: object[] = [
+      {
+        $match: {
+          isPrivate: false,
+          deletedAt: null,
+          authorId: { $in: topAuthorIds },
+          ...(dateFilter ? { createdAt: { $gte: dateFilter } } : {}),
+        },
+      },
+      { $group: { _id: "$authorId", promptCount: { $sum: 1 } } },
+    ];
+
+    const promptCounts = await promptsCol()
+      .aggregate<{ _id: string; promptCount: number }>(promptCountPipeline)
+      .toArray();
+
+    const promptCountMap = new Map<string, number>(
+      promptCounts.map((p) => [p._id, p.promptCount])
+    );
+
+    // Fetch user details for top authors
+    const topAuthorObjectIds = topAuthorIds
+      .filter((id) => /^[0-9a-fA-F]{24}$/.test(id))
+      .map((id) => new ObjectId(id));
+
+    const topUsers = topAuthorObjectIds.length
+      ? await usersCol()
+          .find(
+            { _id: { $in: topAuthorObjectIds } },
+            { projection: { _id: 1, name: 1, username: 1, avatar: 1 } }
+          )
+          .toArray()
+      : [];
+
     let leaderboard = topUsers
-      .map((user) => ({
-        id: user.id,
-        name: user.name,
-        username: user.username,
-        avatar: user.avatar,
-        totalUpvotes: authorVoteCounts.get(user.id) || 0,
-        promptCount: user._count.prompts,
-      }))
+      .map((user) => {
+        const uid = user._id.toHexString();
+        return {
+          id: uid,
+          name: user.name,
+          username: user.username,
+          avatar: user.avatar,
+          totalUpvotes: authorVoteCounts.get(uid) ?? 0,
+          promptCount: promptCountMap.get(uid) ?? 0,
+        };
+      })
       .sort((a, b) => b.totalUpvotes - a.totalUpvotes);
 
     const MIN_USERS = 10;
 
-    // If less than 10 users, fill with users who have most prompts
+    // Fill remaining slots with active users who have public prompts
     if (leaderboard.length < MIN_USERS) {
       const existingUserIds = new Set(leaderboard.map((u) => u.id));
 
-      const usersWithPrompts = await db.user.findMany({
-        where: {
-          id: { notIn: Array.from(existingUserIds) },
-          prompts: {
-            some: {
-              isPrivate: false,
-              deletedAt: null,
-              ...(dateFilter ? { createdAt: { gte: dateFilter } } : {}),
-            },
+      // Find authors with public prompts in period that aren't already listed
+      const fillPipeline: object[] = [
+        {
+          $match: {
+            isPrivate: false,
+            deletedAt: null,
+            ...(dateFilter ? { createdAt: { $gte: dateFilter } } : {}),
           },
         },
-        select: {
-          id: true,
-          name: true,
-          username: true,
-          avatar: true,
-          _count: {
-            select: {
-              prompts: {
-                where: {
-                  isPrivate: false,
-                  deletedAt: null,
-                  ...(dateFilter ? { createdAt: { gte: dateFilter } } : {}),
-                },
-              },
-            },
-          },
-        },
-        orderBy: {
-          prompts: {
-            _count: "desc",
-          },
-        },
-        take: MIN_USERS - leaderboard.length,
-      });
+        { $group: { _id: "$authorId", promptCount: { $sum: 1 } } },
+        { $sort: { promptCount: -1 } },
+        { $limit: MIN_USERS * 5 }, // over-fetch to filter already-listed users
+      ];
 
-      const additionalUsers = usersWithPrompts.map((user) => ({
-        id: user.id,
-        name: user.name,
-        username: user.username,
-        avatar: user.avatar,
-        totalUpvotes: 0,
-        promptCount: user._count.prompts,
-      }));
+      const fillAuthors = await promptsCol()
+        .aggregate<{ _id: string; promptCount: number }>(fillPipeline)
+        .toArray();
+
+      const fillAuthorIds = fillAuthors
+        .map((a) => a._id)
+        .filter((id) => !existingUserIds.has(id))
+        .slice(0, MIN_USERS - leaderboard.length);
+
+      const fillObjectIds = fillAuthorIds
+        .filter((id) => /^[0-9a-fA-F]{24}$/.test(id))
+        .map((id) => new ObjectId(id));
+
+      const fillUsers = fillObjectIds.length
+        ? await usersCol()
+            .find(
+              { _id: { $in: fillObjectIds } },
+              { projection: { _id: 1, name: 1, username: 1, avatar: 1 } }
+            )
+            .toArray()
+        : [];
+
+      const fillCountMap = new Map<string, number>(
+        fillAuthors.map((a) => [a._id, a.promptCount])
+      );
+
+      const additionalUsers = fillUsers.map((user) => {
+        const uid = user._id.toHexString();
+        return {
+          id: uid,
+          name: user.name,
+          username: user.username,
+          avatar: user.avatar,
+          totalUpvotes: 0,
+          promptCount: fillCountMap.get(uid) ?? 0,
+        };
+      });
 
       leaderboard = [...leaderboard, ...additionalUsers];
     }
@@ -144,7 +164,7 @@ const getLeaderboard = unstable_cache(
     return { period, leaderboard };
   },
   ["leaderboard"],
-  { tags: ["leaderboard"], revalidate: 3600 } // Cache for 1 hour
+  { tags: ["leaderboard"], revalidate: 3600 }
 );
 
 export async function GET(request: Request) {

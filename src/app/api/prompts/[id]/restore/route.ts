@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
+import { ObjectId } from "mongodb";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
 
 export async function POST(
   request: Request,
@@ -19,11 +20,18 @@ export async function POST(
 
     const { id } = await params;
 
+    let oid: ObjectId;
+    try {
+      oid = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "Prompt not found" }, { status: 404 });
+    }
+
     // Check if prompt exists and is deleted
-    const prompt = await db.prompt.findUnique({
-      where: { id },
-      select: { id: true, deletedAt: true },
-    });
+    const prompt = await promptsCol().findOne(
+      { _id: oid },
+      { projection: { deletedAt: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json({ error: "Prompt not found" }, { status: 404 });
@@ -34,10 +42,10 @@ export async function POST(
     }
 
     // Restore the prompt by setting deletedAt to null
-    await db.prompt.update({
-      where: { id },
-      data: { deletedAt: null },
-    });
+    await promptsCol().updateOne(
+      { _id: oid },
+      { $set: { deletedAt: null, updatedAt: new Date() } }
+    );
 
     return NextResponse.json({ success: true });
   } catch (error) {

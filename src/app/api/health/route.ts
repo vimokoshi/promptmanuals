@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    // Check database connection
-    await db.$queryRaw`SELECT 1`;
+    // Check database connection with a lightweight count
+    await promptsCol().countDocuments({}, { limit: 1 });
 
     return NextResponse.json(
       {

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, changeRequestsCol, usersCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
 const createChangeRequestSchema = z.object({
   proposedContent: z.string().min(1),
@@ -24,11 +25,21 @@ export async function POST(
 
     const { id: promptId } = await params;
 
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
     // Check if prompt exists
-    const prompt = await db.prompt.findUnique({
-      where: { id: promptId },
-      select: { id: true, authorId: true, isPrivate: true, content: true, title: true },
-    });
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid },
+      { projection: { authorId: 1, isPrivate: 1, content: 1, title: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json(
@@ -65,17 +76,35 @@ export async function POST(
 
     const { proposedContent, proposedTitle, reason } = parsed.data;
 
-    const changeRequest = await db.changeRequest.create({
-      data: {
-        originalContent: prompt.content,
-        originalTitle: prompt.title,
-        proposedContent,
-        proposedTitle,
-        reason,
-        promptId,
-        authorId: session.user.id,
-      },
-    });
+    const now = new Date();
+    const result = await changeRequestsCol().insertOne({
+      originalContent: prompt.content,
+      originalTitle: prompt.title,
+      proposedContent,
+      proposedTitle: proposedTitle ?? null,
+      reason: reason ?? null,
+      status: "PENDING",
+      reviewNote: null,
+      promptId,
+      authorId: session.user.id,
+      createdAt: now,
+      updatedAt: now,
+    } as any);
+
+    const changeRequest = {
+      id: result.insertedId.toHexString(),
+      originalContent: prompt.content,
+      originalTitle: prompt.title,
+      proposedContent,
+      proposedTitle: proposedTitle ?? null,
+      reason: reason ?? null,
+      status: "PENDING",
+      reviewNote: null,
+      promptId,
+      authorId: session.user.id,
+      createdAt: now,
+      updatedAt: now,
+    };
 
     return NextResponse.json(changeRequest, { status: 201 });
   } catch (error) {
@@ -94,20 +123,31 @@ export async function GET(
   try {
     const { id: promptId } = await params;
 
-    const changeRequests = await db.changeRequest.findMany({
-      where: { promptId },
-      orderBy: { createdAt: "desc" },
-      include: {
-        author: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-            avatar: true,
-          },
-        },
-      },
-    });
+    const rawRequests = await changeRequestsCol()
+      .find({ promptId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // Fetch all authors in one query
+    const authorIds = [...new Set(rawRequests.map((r) => r.authorId))];
+    const authors = await usersCol()
+      .find(
+        { _id: { $in: authorIds as any } },
+        { projection: { _id: 1, name: 1, username: 1, avatar: 1 } }
+      )
+      .toArray();
+    const authorMap = new Map(
+      authors.map((a) => [
+        a._id.toHexString(),
+        { id: a._id.toHexString(), name: a.name, username: a.username, avatar: a.avatar },
+      ])
+    );
+
+    const changeRequests = rawRequests.map((r) => ({
+      ...r,
+      id: r._id.toHexString(),
+      author: authorMap.get(r.authorId) ?? null,
+    }));
 
     return NextResponse.json(changeRequests);
   } catch (error) {

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { ObjectId } from "mongodb";
+import { promptsCol } from "@/lib/mongodb";
 
 type OutputFormat = "md" | "yml";
 type FileType = "prompt" | "skill";
@@ -59,11 +60,18 @@ export async function GET(
   const { id: idParam } = await params;
   const { id, format, fileType } = parseIdParam(idParam);
 
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(id);
+  } catch {
+    return new NextResponse("Prompt not found", { status: 404 });
+  }
+
   // Unlisted prompts are accessible via direct link (like YouTube unlisted videos)
-  const prompt = await db.prompt.findFirst({
-    where: { id, deletedAt: null, isPrivate: false },
-    select: { title: true, description: true, content: true, type: true },
-  });
+  const prompt = await promptsCol().findOne(
+    { _id: oid, deletedAt: null, isPrivate: false },
+    { projection: { title: 1, description: 1, content: 1, type: 1 } }
+  );
 
   if (!prompt) {
     return new NextResponse("Prompt not found", { status: 404 });

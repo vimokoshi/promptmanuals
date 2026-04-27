@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { revalidatePath, revalidateTag } from "next/cache";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, promptConnectionsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
 const updateConnectionSchema = z.object({
   label: z.string().min(1).max(100).optional(),
@@ -22,14 +23,14 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
   const { id, connectionId } = await params;
 
   try {
-    const connection = await db.promptConnection.findUnique({
-      where: { id: connectionId },
-      include: {
-        source: {
-          select: { authorId: true },
-        },
-      },
-    });
+    let connectionOid: ObjectId;
+    try {
+      connectionOid = new ObjectId(connectionId);
+    } catch {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+    }
+
+    const connection = await promptConnectionsCol().findOne({ _id: connectionOid });
 
     if (!connection) {
       return NextResponse.json(
@@ -45,9 +46,22 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
       );
     }
 
+    // Fetch source prompt for ownership check
+    let sourceOid: ObjectId;
+    try {
+      sourceOid = new ObjectId(connection.sourceId);
+    } catch {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+    }
+
+    const sourcePrompt = await promptsCol().findOne(
+      { _id: sourceOid },
+      { projection: { authorId: 1 } }
+    );
+
     if (
-      connection.source.authorId !== session.user.id &&
-      session.user.role !== "ADMIN"
+      !sourcePrompt ||
+      (sourcePrompt.authorId !== session.user.id && session.user.role !== "ADMIN")
     ) {
       return NextResponse.json(
         { error: "You can only delete connections from your own prompts" },
@@ -55,9 +69,7 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
       );
     }
 
-    await db.promptConnection.delete({
-      where: { id: connectionId },
-    });
+    await promptConnectionsCol().deleteOne({ _id: connectionOid });
 
     // Revalidate the prompt page and flow cache
     revalidatePath(`/prompts/${id}`);
@@ -85,14 +97,14 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
     const body = await request.json();
     const data = updateConnectionSchema.parse(body);
 
-    const connection = await db.promptConnection.findUnique({
-      where: { id: connectionId },
-      include: {
-        source: {
-          select: { authorId: true },
-        },
-      },
-    });
+    let connectionOid: ObjectId;
+    try {
+      connectionOid = new ObjectId(connectionId);
+    } catch {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+    }
+
+    const connection = await promptConnectionsCol().findOne({ _id: connectionOid });
 
     if (!connection) {
       return NextResponse.json(
@@ -108,9 +120,22 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
       );
     }
 
+    // Fetch source prompt for ownership check
+    let sourceOid: ObjectId;
+    try {
+      sourceOid = new ObjectId(connection.sourceId);
+    } catch {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+    }
+
+    const sourcePrompt = await promptsCol().findOne(
+      { _id: sourceOid },
+      { projection: { authorId: 1 } }
+    );
+
     if (
-      connection.source.authorId !== session.user.id &&
-      session.user.role !== "ADMIN"
+      !sourcePrompt ||
+      (sourcePrompt.authorId !== session.user.id && session.user.role !== "ADMIN")
     ) {
       return NextResponse.json(
         { error: "You can only update connections on your own prompts" },
@@ -118,19 +143,35 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
       );
     }
 
-    const updated = await db.promptConnection.update({
-      where: { id: connectionId },
-      data,
-      include: {
-        target: {
-          select: {
-            id: true,
-            title: true,
-            slug: true,
-          },
-        },
-      },
-    });
+    const now = new Date();
+    await promptConnectionsCol().updateOne(
+      { _id: connectionOid },
+      { $set: { ...data, updatedAt: now } }
+    );
+
+    // Fetch target for response
+    let targetOid: ObjectId;
+    try {
+      targetOid = new ObjectId(connection.targetId);
+    } catch {
+      targetOid = connection.targetId as unknown as ObjectId;
+    }
+    const target = await promptsCol().findOne(
+      { _id: targetOid },
+      { projection: { _id: 1, title: 1, slug: 1 } }
+    );
+
+    const updated = {
+      id: connectionOid.toHexString(),
+      sourceId: connection.sourceId,
+      targetId: connection.targetId,
+      label: data.label ?? connection.label,
+      order: data.order ?? connection.order,
+      updatedAt: now,
+      target: target
+        ? { id: target._id.toHexString(), title: target.title, slug: target.slug }
+        : null,
+    };
 
     // Revalidate prompt flow cache
     revalidateTag("prompt-flow", "max");

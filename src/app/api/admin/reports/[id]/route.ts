@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
 
 const updateSchema = z.object({
   status: z.enum(["PENDING", "REVIEWED", "DISMISSED"]),
@@ -21,12 +21,25 @@ export async function PATCH(
     const body = await request.json();
     const { status } = updateSchema.parse(body);
 
-    const report = await db.promptReport.update({
-      where: { id },
-      data: { status },
-    });
+    // Reports are embedded in prompts.reports[]; find the prompt containing this report
+    const result = await promptsCol().findOneAndUpdate(
+      { "reports._id": id },
+      {
+        $set: {
+          "reports.$.status": status,
+          "reports.$.updatedAt": new Date(),
+          updatedAt: new Date(),
+        },
+      },
+      { returnDocument: "after" }
+    );
 
-    return NextResponse.json(report);
+    if (!result) {
+      return NextResponse.json({ error: "Report not found" }, { status: 404 });
+    }
+
+    const report = result.reports.find((r) => r._id === id);
+    return NextResponse.json(report ?? { _id: id, status });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return NextResponse.json({ error: "Invalid data" }, { status: 400 });

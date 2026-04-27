@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { commentsCol, promptsCol, usersCol, notificationsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import { getConfig } from "@/lib/config";
 import { z } from "zod";
 
@@ -27,10 +28,20 @@ export async function GET(
     const session = await auth();
 
     // Check if prompt exists
-    const prompt = await db.prompt.findUnique({
-      where: { id: promptId, deletedAt: null },
-      select: { id: true, isPrivate: true, authorId: true },
-    });
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid, deletedAt: null },
+      { projection: { _id: 1, isPrivate: 1, authorId: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json(
@@ -50,61 +61,66 @@ export async function GET(
     const isAdmin = session?.user?.role === "ADMIN";
     const userId = session?.user?.id;
 
-    // Get all comments with cached score and user's vote
-    const comments = await db.comment.findMany({
-      where: { 
-        promptId,
-        deletedAt: null,
-      },
-      include: {
-        author: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-            avatar: true,
-            role: true,
-          },
+    // Get all non-deleted comments for this prompt
+    const comments = await commentsCol()
+      .find({ promptId, deletedAt: null })
+      .sort({ createdAt: 1 })
+      .toArray();
+
+    // Gather unique authorIds to batch-fetch authors
+    const authorIds = [...new Set(comments.map((c) => c.authorId))];
+    const authorDocs = authorIds.length
+      ? await usersCol()
+          .find(
+            { _id: { $in: authorIds.map((aid) => { try { return new ObjectId(aid); } catch { return null; } }).filter(Boolean) as ObjectId[] } },
+            { projection: { _id: 1, name: 1, username: 1, avatar: 1, role: 1 } }
+          )
+          .toArray()
+      : [];
+
+    const authorMap = new Map(
+      authorDocs.map((u) => [
+        u._id.toHexString(),
+        {
+          id: u._id.toHexString(),
+          name: u.name,
+          username: u.username,
+          avatar: u.avatar ?? null,
+          role: u.role,
         },
-        votes: session?.user ? {
-          where: { userId: session.user.id },
-          select: { value: true },
-        } : false,
-        _count: {
-          select: { replies: true },
-        },
-      },
-      orderBy: { createdAt: "asc" },
-    });
+      ])
+    );
 
     // Transform and filter comments
     // Shadow-ban: flagged comments only visible to admins and the comment author
     const transformedComments = comments
-      .filter((comment: typeof comments[number]) => {
-        // Admins see all comments
+      .filter((comment) => {
         if (isAdmin) return true;
-        // Non-flagged comments visible to everyone
         if (!comment.flagged) return true;
-        // Flagged comments only visible to their author (shadow-ban)
         return comment.authorId === userId;
       })
-      .map((comment: typeof comments[number]) => {
-        const userVote = session?.user && comment.votes && Array.isArray(comment.votes) && comment.votes.length > 0
-          ? (comment.votes[0] as { value: number }).value
+      .map((comment) => {
+        const userVote = userId
+          ? (comment.votes ?? []).find((v) => v.userId === userId)?.value ?? 0
           : 0;
-      
+
+        // Count replies (comments whose parentId equals this comment's id)
+        const commentIdStr = comment._id.toHexString();
+        const replyCount = comments.filter(
+          (c) => c.parentId === commentIdStr
+        ).length;
+
         return {
-          id: comment.id,
+          id: commentIdStr,
           content: comment.content,
           createdAt: comment.createdAt,
           updatedAt: comment.updatedAt,
           parentId: comment.parentId,
-          // Only admins see the flagged status
           flagged: isAdmin ? comment.flagged : false,
-          author: comment.author,
+          author: authorMap.get(comment.authorId) ?? null,
           score: comment.score,
           userVote,
-          replyCount: comment._count.replies,
+          replyCount,
         };
       });
 
@@ -142,7 +158,7 @@ export async function POST(
 
     const { id: promptId } = await params;
     const body = await request.json();
-    
+
     const validation = createCommentSchema.safeParse(body);
     if (!validation.success) {
       return NextResponse.json(
@@ -154,10 +170,20 @@ export async function POST(
     const { content, parentId } = validation.data;
 
     // Check if prompt exists
-    const prompt = await db.prompt.findUnique({
-      where: { id: promptId, deletedAt: null },
-      select: { id: true, isPrivate: true, authorId: true },
-    });
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid, deletedAt: null },
+      { projection: { _id: 1, isPrivate: 1, authorId: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json(
@@ -166,7 +192,6 @@ export async function POST(
       );
     }
 
-    // Check if user can view private prompt
     if (prompt.isPrivate && prompt.authorId !== session.user.id) {
       return NextResponse.json(
         { error: "not_found", message: "Prompt not found" },
@@ -176,10 +201,20 @@ export async function POST(
 
     // If replying to a comment, verify parent exists and belongs to same prompt
     if (parentId) {
-      const parentComment = await db.comment.findUnique({
-        where: { id: parentId, deletedAt: null },
-        select: { id: true, promptId: true },
-      });
+      let parentOid: ObjectId;
+      try {
+        parentOid = new ObjectId(parentId);
+      } catch {
+        return NextResponse.json(
+          { error: "invalid_parent", message: "Parent comment not found" },
+          { status: 400 }
+        );
+      }
+
+      const parentComment = await commentsCol().findOne(
+        { _id: parentOid, deletedAt: null },
+        { projection: { _id: 1, promptId: 1 } }
+      );
 
       if (!parentComment || parentComment.promptId !== promptId) {
         return NextResponse.json(
@@ -190,71 +225,97 @@ export async function POST(
     }
 
     // Create comment
-    const comment = await db.comment.create({
-      data: {
-        content,
-        promptId,
-        authorId: session.user.id,
-        parentId: parentId || null,
-      },
-      include: {
-        author: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-            avatar: true,
-            role: true,
-          },
-        },
-      },
-    });
+    const now = new Date();
+    const insertResult = await commentsCol().insertOne({
+      content,
+      promptId,
+      authorId: session.user.id,
+      parentId: parentId ?? null,
+      score: 0,
+      votes: [],
+      flagged: false,
+      flaggedAt: null,
+      flaggedBy: null,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    } as any);
+
+    const commentId = insertResult.insertedId.toHexString();
+
+    // Fetch author for response
+    let authorOid: ObjectId;
+    try {
+      authorOid = new ObjectId(session.user.id);
+    } catch {
+      authorOid = new ObjectId();
+    }
+    const authorDoc = await usersCol().findOne(
+      { _id: authorOid },
+      { projection: { _id: 1, name: 1, username: 1, avatar: 1, role: 1 } }
+    );
+    const author = authorDoc
+      ? {
+          id: authorDoc._id.toHexString(),
+          name: authorDoc.name,
+          username: authorDoc.username,
+          avatar: authorDoc.avatar ?? null,
+          role: authorDoc.role,
+        }
+      : null;
 
     // Create notification for prompt owner (if not commenting on own prompt)
     if (prompt.authorId !== session.user.id) {
-      await db.notification.create({
-        data: {
-          type: "COMMENT",
-          userId: prompt.authorId,
-          actorId: session.user.id,
-          promptId,
-          commentId: comment.id,
-        },
-      });
+      await notificationsCol().insertOne({
+        type: "COMMENT",
+        userId: prompt.authorId,
+        actorId: session.user.id,
+        promptId,
+        commentId,
+        read: false,
+        createdAt: now,
+      } as any);
     }
 
-    // If replying to a comment, also notify the parent comment author
+    // If replying, also notify the parent comment author
     if (parentId) {
-      const parentComment = await db.comment.findUnique({
-        where: { id: parentId },
-        select: { authorId: true },
-      });
-      
-      // Notify parent comment author (if not replying to self and not the prompt owner who already got notified)
-      if (parentComment && 
-          parentComment.authorId !== session.user.id && 
-          parentComment.authorId !== prompt.authorId) {
-        await db.notification.create({
-          data: {
-            type: "REPLY",
-            userId: parentComment.authorId,
-            actorId: session.user.id,
-            promptId,
-            commentId: comment.id,
-          },
-        });
+      let parentOid: ObjectId;
+      try {
+        parentOid = new ObjectId(parentId);
+      } catch {
+        parentOid = new ObjectId();
+      }
+      const parentComment = await commentsCol().findOne(
+        { _id: parentOid },
+        { projection: { authorId: 1 } }
+      );
+
+      if (
+        parentComment &&
+        parentComment.authorId !== session.user.id &&
+        parentComment.authorId !== prompt.authorId
+      ) {
+        await notificationsCol().insertOne({
+          type: "REPLY",
+          userId: parentComment.authorId,
+          actorId: session.user.id,
+          promptId,
+          commentId,
+          read: false,
+          createdAt: now,
+        } as any);
       }
     }
 
     return NextResponse.json({
       comment: {
-        id: comment.id,
-        content: comment.content,
-        createdAt: comment.createdAt,
-        updatedAt: comment.updatedAt,
-        parentId: comment.parentId,
-        flagged: false, // New comments are never flagged
-        author: comment.author,
+        id: commentId,
+        content,
+        createdAt: now,
+        updatedAt: now,
+        parentId: parentId ?? null,
+        flagged: false,
+        author,
         score: 0,
         userVote: 0,
         replyCount: 0,

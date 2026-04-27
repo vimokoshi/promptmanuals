@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { usersCol, promptsCol } from "@/lib/mongodb";
+import { Filter } from "mongodb";
+import type { UserDocument } from "@/lib/mongodb";
 
 // GET - List all users for admin with pagination and search
 export async function GET(request: NextRequest) {
   try {
     const session = await auth();
 
-    // Check if user is authenticated
     if (!session?.user) {
       return NextResponse.json(
         { error: "unauthorized", message: "Authentication required" },
@@ -15,7 +16,6 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // Check if user is admin
     if (session.user.role !== "ADMIN") {
       return NextResponse.json(
         { error: "forbidden", message: "Admin access required" },
@@ -31,89 +31,84 @@ export async function GET(request: NextRequest) {
     const sortOrder = searchParams.get("sortOrder") || "desc";
     const filter = searchParams.get("filter") || "all";
 
-    // Validate pagination
     const validPage = Math.max(1, page);
     const validLimit = Math.min(Math.max(1, limit), 100);
     const skip = (validPage - 1) * validLimit;
 
-    // Build filter conditions
-    type WhereCondition = {
-      OR?: Array<{ email?: { contains: string; mode: "insensitive" }; username?: { contains: string; mode: "insensitive" }; name?: { contains: string; mode: "insensitive" } }>;
-      role?: "ADMIN" | "USER";
-      verified?: boolean;
-      flagged?: boolean;
-    };
+    // Build MongoDB filter
+    const mongoFilter: Filter<UserDocument> = {};
 
-    const filterConditions: WhereCondition = {};
-    
     switch (filter) {
       case "admin":
-        filterConditions.role = "ADMIN";
+        mongoFilter.role = "ADMIN";
         break;
       case "user":
-        filterConditions.role = "USER";
+        mongoFilter.role = "USER";
         break;
       case "verified":
-        filterConditions.verified = true;
+        mongoFilter.verified = true;
         break;
       case "unverified":
-        filterConditions.verified = false;
+        mongoFilter.verified = false;
         break;
       case "flagged":
-        filterConditions.flagged = true;
+        mongoFilter.flagged = true;
         break;
       default:
-        // "all" - no filter
         break;
     }
 
-    // Build where clause combining search and filters
-    const where: WhereCondition = {
-      ...filterConditions,
-      ...(search && {
-        OR: [
-          { email: { contains: search, mode: "insensitive" as const } },
-          { username: { contains: search, mode: "insensitive" as const } },
-          { name: { contains: search, mode: "insensitive" as const } },
-        ],
-      }),
-    };
+    if (search) {
+      const regex = { $regex: search, $options: "i" };
+      (mongoFilter as Record<string, unknown>).$or = [
+        { email: regex },
+        { username: regex },
+        { name: regex },
+      ];
+    }
 
-    // Build orderBy
+    // Sort field validation
     const validSortFields = ["createdAt", "email", "username", "name"];
-    const orderByField = validSortFields.includes(sortBy) ? sortBy : "createdAt";
-    const orderByDirection = sortOrder === "asc" ? "asc" : "desc";
+    const sortField = validSortFields.includes(sortBy) ? sortBy : "createdAt";
+    const sortDir = sortOrder === "asc" ? 1 : -1;
 
-    // Fetch users and total count
-    const [users, total] = await Promise.all([
-      db.user.findMany({
-        where,
-        skip,
-        take: validLimit,
-        orderBy: { [orderByField]: orderByDirection },
-        select: {
-          id: true,
-          email: true,
-          username: true,
-          name: true,
-          avatar: true,
-          role: true,
-          verified: true,
-          flagged: true,
-          flaggedAt: true,
-          flaggedReason: true,
-          dailyGenerationLimit: true,
-          generationCreditsRemaining: true,
-          createdAt: true,
-          _count: {
-            select: {
-              prompts: true,
-            },
-          },
-        },
-      }),
-      db.user.count({ where }),
+    const [rawUsers, total] = await Promise.all([
+      usersCol()
+        .find(mongoFilter)
+        .sort({ [sortField]: sortDir })
+        .skip(skip)
+        .limit(validLimit)
+        .toArray(),
+      usersCol().countDocuments(mongoFilter),
     ]);
+
+    // Fetch prompt counts per user
+    const userIds = rawUsers.map((u) => u._id.toHexString());
+    const promptCounts = await promptsCol()
+      .aggregate<{ _id: string; count: number }>([
+        { $match: { authorId: { $in: userIds }, deletedAt: null } },
+        { $group: { _id: "$authorId", count: { $sum: 1 } } },
+      ])
+      .toArray();
+
+    const countMap = new Map(promptCounts.map((p) => [p._id, p.count]));
+
+    const users = rawUsers.map((u) => ({
+      id: u._id.toHexString(),
+      email: u.email,
+      username: u.username,
+      name: u.name,
+      avatar: u.avatar,
+      role: u.role,
+      verified: u.verified,
+      flagged: u.flagged,
+      flaggedAt: u.flaggedAt,
+      flaggedReason: u.flaggedReason,
+      dailyGenerationLimit: u.dailyGenerationLimit,
+      generationCreditsRemaining: u.generationCreditsRemaining,
+      createdAt: u.createdAt,
+      _count: { prompts: countMap.get(u._id.toHexString()) ?? 0 },
+    }));
 
     return NextResponse.json({
       users,

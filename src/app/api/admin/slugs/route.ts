@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
 import { generatePromptSlug } from "@/lib/slug";
 
 export async function POST(request: Request) {
@@ -17,15 +17,15 @@ export async function POST(request: Request) {
     const { searchParams } = new URL(request.url);
     const regenerateAll = searchParams.get("regenerate") === "true";
 
-    // Get prompts that need slug generation
-    const whereClause = regenerateAll
+    // Build query: either all active prompts or only those missing slugs
+    const query = regenerateAll
       ? { deletedAt: null }
       : { slug: null, deletedAt: null };
 
-    const prompts = await db.prompt.findMany({
-      where: whereClause,
-      select: { id: true, title: true },
-    });
+    const prompts = await promptsCol()
+      .find(query)
+      .project<{ _id: import("mongodb").ObjectId; title: string }>({ _id: 1, title: 1 })
+      .toArray();
 
     if (prompts.length === 0) {
       return NextResponse.json({
@@ -35,7 +35,6 @@ export async function POST(request: Request) {
       });
     }
 
-    // Stream response for progress updates
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
@@ -44,22 +43,21 @@ export async function POST(request: Request) {
 
         for (let i = 0; i < prompts.length; i++) {
           const prompt = prompts[i];
-          
+
           try {
             const slug = await generatePromptSlug(prompt.title);
-            
-            await db.prompt.update({
-              where: { id: prompt.id },
-              data: { slug },
-            });
-            
+
+            await promptsCol().updateOne(
+              { _id: prompt._id },
+              { $set: { slug, updatedAt: new Date() } }
+            );
+
             success++;
           } catch (error) {
-            console.error(`Failed to generate slug for prompt ${prompt.id}:`, error);
+            console.error(`Failed to generate slug for prompt ${prompt._id.toHexString()}:`, error);
             failed++;
           }
 
-          // Send progress update
           const progress = {
             current: i + 1,
             total: prompts.length,
@@ -70,7 +68,6 @@ export async function POST(request: Request) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(progress)}\n\n`));
         }
 
-        // Send final result
         const finalResult = {
           current: prompts.length,
           total: prompts.length,
@@ -112,17 +109,8 @@ export async function GET() {
     }
 
     const [promptsWithoutSlugs, totalPrompts] = await Promise.all([
-      db.prompt.count({
-        where: {
-          slug: null,
-          deletedAt: null,
-        },
-      }),
-      db.prompt.count({
-        where: {
-          deletedAt: null,
-        },
-      }),
+      promptsCol().countDocuments({ slug: null, deletedAt: null }),
+      promptsCol().countDocuments({ deletedAt: null }),
     ]);
 
     return NextResponse.json({

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { commentsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import { getConfig } from "@/lib/config";
 
 // DELETE - Delete a comment (author or admin only)
@@ -27,15 +28,20 @@ export async function DELETE(
 
     const { id: promptId, commentId } = await params;
 
-    // Find the comment
-    const comment = await db.comment.findUnique({
-      where: { id: commentId, deletedAt: null },
-      select: { 
-        id: true, 
-        promptId: true, 
-        authorId: true,
-      },
-    });
+    let commentOid: ObjectId;
+    try {
+      commentOid = new ObjectId(commentId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Comment not found" },
+        { status: 404 }
+      );
+    }
+
+    const comment = await commentsCol().findOne(
+      { _id: commentOid, deletedAt: null },
+      { projection: { _id: 1, promptId: 1, authorId: 1 } }
+    );
 
     if (!comment || comment.promptId !== promptId) {
       return NextResponse.json(
@@ -44,7 +50,6 @@ export async function DELETE(
       );
     }
 
-    // Check if user can delete (author or admin)
     const isAuthor = comment.authorId === session.user.id;
     const isAdmin = session.user.role === "ADMIN";
 
@@ -55,11 +60,11 @@ export async function DELETE(
       );
     }
 
-    // Soft delete the comment
-    await db.comment.update({
-      where: { id: commentId },
-      data: { deletedAt: new Date() },
-    });
+    // Soft delete
+    await commentsCol().updateOne(
+      { _id: commentOid },
+      { $set: { deletedAt: new Date(), updatedAt: new Date() } }
+    );
 
     return NextResponse.json({ deleted: true });
   } catch (error) {

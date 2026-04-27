@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
+import type { EmbeddedReport, ReportReason } from "@/lib/mongodb";
 
 const reportSchema = z.object({
   promptId: z.string().min(1),
@@ -19,11 +21,19 @@ export async function POST(request: Request) {
     const body = await request.json();
     const { promptId, reason, details } = reportSchema.parse(body);
 
+    const promptObjectId = /^[0-9a-fA-F]{24}$/.test(promptId)
+      ? new ObjectId(promptId)
+      : null;
+
+    if (!promptObjectId) {
+      return NextResponse.json({ error: "Prompt not found" }, { status: 404 });
+    }
+
     // Check if prompt exists
-    const prompt = await db.prompt.findUnique({
-      where: { id: promptId },
-      select: { id: true, authorId: true },
-    });
+    const prompt = await promptsCol().findOne(
+      { _id: promptObjectId },
+      { projection: { _id: 1, authorId: 1, reports: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json({ error: "Prompt not found" }, { status: 404 });
@@ -37,14 +47,10 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check if user already reported this prompt
-    const existingReport = await db.promptReport.findFirst({
-      where: {
-        promptId,
-        reporterId: session.user.id,
-        status: "PENDING",
-      },
-    });
+    // Check if user already has a pending report for this prompt
+    const existingReport = (prompt.reports ?? []).find(
+      (r) => r.reporterId === session.user.id && r.status === "PENDING"
+    );
 
     if (existingReport) {
       return NextResponse.json(
@@ -53,15 +59,22 @@ export async function POST(request: Request) {
       );
     }
 
-    // Create the report
-    await db.promptReport.create({
-      data: {
-        promptId,
-        reporterId: session.user.id,
-        reason,
-        details: details || null,
-      },
-    });
+    // Embed the new report into the prompt document
+    const now = new Date();
+    const reportDoc: EmbeddedReport = {
+      _id: new ObjectId().toHexString(),
+      reason: reason as ReportReason,
+      details: details ?? null,
+      status: "PENDING",
+      createdAt: now,
+      updatedAt: now,
+      reporterId: session.user.id,
+    };
+
+    await promptsCol().updateOne(
+      { _id: promptObjectId },
+      { $push: { reports: reportDoc } as any }
+    );
 
     return NextResponse.json({ success: true });
   } catch (error) {

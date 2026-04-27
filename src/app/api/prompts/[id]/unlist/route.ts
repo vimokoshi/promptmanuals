@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
+import { ObjectId } from "mongodb";
 import { revalidateTag } from "next/cache";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
 
 // Toggle unlist status (admin only)
 export async function POST(
@@ -27,11 +28,21 @@ export async function POST(
       );
     }
 
+    let oid: ObjectId;
+    try {
+      oid = new ObjectId(id);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
     // Check if prompt exists
-    const existing = await db.prompt.findUnique({
-      where: { id },
-      select: { id: true, isUnlisted: true },
-    });
+    const existing = await promptsCol().findOne(
+      { _id: oid },
+      { projection: { isUnlisted: 1 } }
+    );
 
     if (!existing) {
       return NextResponse.json(
@@ -42,24 +53,27 @@ export async function POST(
 
     // Toggle unlist status
     const newUnlistedStatus = !existing.isUnlisted;
-    
-    await db.prompt.update({
-      where: { id },
-      data: { 
-        isUnlisted: newUnlistedStatus,
-        unlistedAt: newUnlistedStatus ? new Date() : null,
-      },
-    });
+
+    await promptsCol().updateOne(
+      { _id: oid },
+      {
+        $set: {
+          isUnlisted: newUnlistedStatus,
+          unlistedAt: newUnlistedStatus ? new Date() : null,
+          updatedAt: new Date(),
+        },
+      }
+    );
 
     // Revalidate caches
-    revalidateTag("prompts", "max");
-    revalidateTag("categories", "max");
-    revalidateTag("tags", "max");
+    revalidateTag("prompts");
+    revalidateTag("categories");
+    revalidateTag("tags");
 
-    return NextResponse.json({ 
-      success: true, 
+    return NextResponse.json({
+      success: true,
       isUnlisted: newUnlistedStatus,
-      message: newUnlistedStatus ? "Prompt unlisted" : "Prompt relisted" 
+      message: newUnlistedStatus ? "Prompt unlisted" : "Prompt relisted",
     });
   } catch (error) {
     console.error("Unlist prompt error:", error);

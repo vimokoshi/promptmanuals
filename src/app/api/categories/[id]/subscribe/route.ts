@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { categorySubscriptionsCol, categoriesCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
 // POST - Subscribe to a category
 export async function POST(
@@ -17,11 +18,21 @@ export async function POST(
     }
 
     const { id: categoryId } = await params;
+    const userId = session.user.id;
 
     // Check if category exists
-    const category = await db.category.findUnique({
-      where: { id: categoryId },
-    });
+    const categoryObjectId = /^[0-9a-fA-F]{24}$/.test(categoryId)
+      ? new ObjectId(categoryId)
+      : null;
+
+    if (!categoryObjectId) {
+      return NextResponse.json(
+        { error: "not_found", message: "Category not found" },
+        { status: 404 }
+      );
+    }
+
+    const category = await categoriesCol().findOne({ _id: categoryObjectId });
 
     if (!category) {
       return NextResponse.json(
@@ -31,14 +42,7 @@ export async function POST(
     }
 
     // Check if already subscribed
-    const existing = await db.categorySubscription.findUnique({
-      where: {
-        userId_categoryId: {
-          userId: session.user.id,
-          categoryId,
-        },
-      },
-    });
+    const existing = await categorySubscriptionsCol().findOne({ userId, categoryId });
 
     if (existing) {
       return NextResponse.json(
@@ -48,23 +52,21 @@ export async function POST(
     }
 
     // Create subscription
-    const subscription = await db.categorySubscription.create({
-      data: {
-        userId: session.user.id,
-        categoryId,
-      },
-      include: {
-        category: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
-          },
-        },
-      },
+    await categorySubscriptionsCol().insertOne({
+      _id: new ObjectId(),
+      userId,
+      categoryId,
+      createdAt: new Date(),
     });
 
-    return NextResponse.json({ subscribed: true, category: subscription.category });
+    return NextResponse.json({
+      subscribed: true,
+      category: {
+        id: category._id.toHexString(),
+        name: category.name,
+        slug: category.slug,
+      },
+    });
   } catch (error) {
     console.error("Subscribe error:", error);
     return NextResponse.json(
@@ -91,11 +93,9 @@ export async function DELETE(
     const { id: categoryId } = await params;
 
     // Delete subscription
-    await db.categorySubscription.deleteMany({
-      where: {
-        userId: session.user.id,
-        categoryId,
-      },
+    await categorySubscriptionsCol().deleteOne({
+      userId: session.user.id,
+      categoryId,
     });
 
     return NextResponse.json({ subscribed: false });

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
 import { getConfig } from "@/lib/config";
 
 const registerSchema = z.object({
@@ -35,9 +35,7 @@ export async function POST(request: Request) {
     const { name, username, email, password } = parsed.data;
 
     // Check if email already exists
-    const existingEmail = await db.user.findUnique({
-      where: { email },
-    });
+    const existingEmail = await usersCol().findOne({ email });
 
     if (existingEmail) {
       return NextResponse.json(
@@ -47,8 +45,8 @@ export async function POST(request: Request) {
     }
 
     // Check if username already exists (case-insensitive)
-    const existingUsername = await db.user.findFirst({
-      where: { username: { equals: username, mode: "insensitive" } },
+    const existingUsername = await usersCol().findOne({
+      username: { $regex: `^${username}$`, $options: "i" },
     });
 
     if (existingUsername) {
@@ -62,20 +60,37 @@ export async function POST(request: Request) {
     const hashedPassword = await bcrypt.hash(password, 12);
 
     // Create user
-    const user = await db.user.create({
-      data: {
-        name,
-        username,
-        email,
-        password: hashedPassword,
-      },
-    });
+    const now = new Date();
+    const result = await usersCol().insertOne({
+      name,
+      username,
+      email,
+      password: hashedPassword,
+      avatar: null,
+      bio: null,
+      customLinks: null,
+      role: "USER",
+      locale: "en",
+      emailVerified: null,
+      createdAt: now,
+      updatedAt: now,
+      verified: false,
+      githubUsername: null,
+      apiKey: null,
+      mcpPromptsPublicByDefault: false,
+      flagged: false,
+      flaggedAt: null,
+      flaggedReason: null,
+      dailyGenerationLimit: 10,
+      generationCreditsRemaining: 10,
+      generationCreditsResetAt: null,
+    } as Parameters<ReturnType<typeof usersCol>["insertOne"]>[0]);
 
     return NextResponse.json({
-      id: user.id,
-      name: user.name,
-      username: user.username,
-      email: user.email,
+      id: result.insertedId.toHexString(),
+      name,
+      username,
+      email,
     });
   } catch (error) {
     console.error("Registration error:", error);

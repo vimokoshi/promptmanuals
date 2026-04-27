@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { revalidateTag } from "next/cache";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, promptConnectionsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 
 const createConnectionSchema = z.object({
   targetId: z.string().min(1),
@@ -18,65 +19,87 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
   const { id } = await params;
 
   try {
-    const prompt = await db.prompt.findUnique({
-      where: { id, deletedAt: null },
-      select: { id: true, isPrivate: true, authorId: true },
-    });
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "Prompt not found" }, { status: 404 });
+    }
+
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid, deletedAt: null },
+      { projection: { isPrivate: 1, authorId: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json({ error: "Prompt not found" }, { status: 404 });
     }
 
     // Get all connections where this prompt is involved (source or target)
-    // Exclude "related" label connections - those are for Related Prompts feature, not Prompt Flow
-    const outgoingConnections = await db.promptConnection.findMany({
-      where: { sourceId: id, label: { not: "related" } },
-      orderBy: { order: "asc" },
-      include: {
-        target: {
-          select: {
-            id: true,
-            title: true,
-            slug: true,
-            isPrivate: true,
-            authorId: true,
-          },
-        },
-      },
-    });
+    // Exclude "related" label connections
+    const [outgoingRaw, incomingRaw] = await Promise.all([
+      promptConnectionsCol()
+        .find({ sourceId: id, label: { $ne: "related" } })
+        .sort({ order: 1 })
+        .toArray(),
+      promptConnectionsCol()
+        .find({ targetId: id, label: { $ne: "related" } })
+        .sort({ order: 1 })
+        .toArray(),
+    ]);
 
-    const incomingConnections = await db.promptConnection.findMany({
-      where: { targetId: id, label: { not: "related" } },
-      orderBy: { order: "asc" },
-      include: {
-        source: {
-          select: {
-            id: true,
-            title: true,
-            slug: true,
-            isPrivate: true,
-            authorId: true,
-          },
+    // Collect all referenced prompt IDs
+    const targetIds = outgoingRaw.map((c) => c.targetId);
+    const sourceIds = incomingRaw.map((c) => c.sourceId);
+    const allIds = [...new Set([...targetIds, ...sourceIds])];
+
+    // Fetch referenced prompts in one query
+    const referencedPrompts = await promptsCol()
+      .find(
+        { _id: { $in: allIds.map((pid) => { try { return new ObjectId(pid); } catch { return pid as any; } }) } },
+        { projection: { _id: 1, title: 1, slug: 1, isPrivate: 1, authorId: 1 } }
+      )
+      .toArray();
+    const promptMap = new Map(
+      referencedPrompts.map((p) => [
+        p._id.toHexString(),
+        {
+          id: p._id.toHexString(),
+          title: p.title,
+          slug: p.slug,
+          isPrivate: p.isPrivate,
+          authorId: p.authorId,
         },
-      },
-    });
+      ])
+    );
 
     // Filter out private prompts the user can't see
     const session = await auth();
     const userId = session?.user?.id;
 
-    const filteredOutgoing = outgoingConnections.filter(
-      (c: typeof outgoingConnections[number]) => !c.target.isPrivate || c.target.authorId === userId
-    );
+    const outgoing = outgoingRaw
+      .map((c) => ({
+        id: c._id.toHexString(),
+        sourceId: c.sourceId,
+        targetId: c.targetId,
+        label: c.label,
+        order: c.order,
+        target: promptMap.get(c.targetId) ?? null,
+      }))
+      .filter((c) => c.target && (!c.target.isPrivate || c.target.authorId === userId));
 
-    const filteredIncoming = incomingConnections.filter(
-      (c: typeof incomingConnections[number]) => !c.source.isPrivate || c.source.authorId === userId
-    );
+    const incoming = incomingRaw
+      .map((c) => ({
+        id: c._id.toHexString(),
+        sourceId: c.sourceId,
+        targetId: c.targetId,
+        label: c.label,
+        order: c.order,
+        source: promptMap.get(c.sourceId) ?? null,
+      }))
+      .filter((c) => c.source && (!c.source.isPrivate || c.source.authorId === userId));
 
-    return NextResponse.json({
-      outgoing: filteredOutgoing,
-      incoming: filteredIncoming,
-    });
+    return NextResponse.json({ outgoing, incoming });
   } catch (error) {
     console.error("Failed to fetch connections:", error);
     return NextResponse.json(
@@ -98,11 +121,18 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const body = await request.json();
     const { targetId, label, order } = createConnectionSchema.parse(body);
 
+    let sourceOid: ObjectId;
+    try {
+      sourceOid = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "Source prompt not found" }, { status: 404 });
+    }
+
     // Verify source prompt exists and user owns it
-    const sourcePrompt = await db.prompt.findUnique({
-      where: { id, deletedAt: null },
-      select: { authorId: true },
-    });
+    const sourcePrompt = await promptsCol().findOne(
+      { _id: sourceOid, deletedAt: null },
+      { projection: { authorId: 1 } }
+    );
 
     if (!sourcePrompt) {
       return NextResponse.json(
@@ -121,11 +151,18 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       );
     }
 
-    // Verify target prompt exists and belongs to the user
-    const targetPrompt = await db.prompt.findUnique({
-      where: { id: targetId, deletedAt: null },
-      select: { id: true, title: true, authorId: true },
-    });
+    let targetOid: ObjectId;
+    try {
+      targetOid = new ObjectId(targetId);
+    } catch {
+      return NextResponse.json({ error: "Target prompt not found" }, { status: 404 });
+    }
+
+    // Verify target prompt exists
+    const targetPrompt = await promptsCol().findOne(
+      { _id: targetOid, deletedAt: null },
+      { projection: { title: 1, authorId: 1 } }
+    );
 
     if (!targetPrompt) {
       return NextResponse.json(
@@ -134,7 +171,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       );
     }
 
-    // Verify user owns the target prompt (users can only connect their own prompts)
+    // Verify user owns the target prompt
     if (
       targetPrompt.authorId !== session.user.id &&
       session.user.role !== "ADMIN"
@@ -154,9 +191,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     }
 
     // Check if connection already exists
-    const existing = await db.promptConnection.findUnique({
-      where: { sourceId_targetId: { sourceId: id, targetId } },
-    });
+    const existing = await promptConnectionsCol().findOne({ sourceId: id, targetId });
 
     if (existing) {
       return NextResponse.json(
@@ -168,31 +203,38 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     // Calculate order if not provided
     let connectionOrder = order;
     if (connectionOrder === undefined) {
-      const lastConnection = await db.promptConnection.findFirst({
-        where: { sourceId: id },
-        orderBy: { order: "desc" },
-        select: { order: true },
-      });
-      connectionOrder = (lastConnection?.order ?? -1) + 1;
+      const lastConnection = await promptConnectionsCol()
+        .find({ sourceId: id })
+        .sort({ order: -1 })
+        .limit(1)
+        .toArray();
+      connectionOrder = (lastConnection[0]?.order ?? -1) + 1;
     }
 
-    const connection = await db.promptConnection.create({
-      data: {
-        sourceId: id,
-        targetId,
-        label,
-        order: connectionOrder,
+    const now = new Date();
+    const result = await promptConnectionsCol().insertOne({
+      sourceId: id,
+      targetId,
+      label,
+      order: connectionOrder,
+      createdAt: now,
+      updatedAt: now,
+    } as any);
+
+    const connection = {
+      id: result.insertedId.toHexString(),
+      sourceId: id,
+      targetId,
+      label,
+      order: connectionOrder,
+      createdAt: now,
+      updatedAt: now,
+      target: {
+        id: targetId,
+        title: targetPrompt.title,
+        slug: null as string | null,
       },
-      include: {
-        target: {
-          select: {
-            id: true,
-            title: true,
-            slug: true,
-          },
-        },
-      },
-    });
+    };
 
     // Revalidate prompt flow cache
     revalidateTag("prompt-flow", "max");

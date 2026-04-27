@@ -1,6 +1,7 @@
 import NextAuth from "next-auth";
-import { PrismaAdapter } from "@auth/prisma-adapter";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
+import type { UserDocument } from "@/lib/mongodb";
+import { MongoDBAdapter } from "@/lib/auth/mongodb-adapter";
 import { getConfig } from "@/lib/config";
 import { initializePlugins, getAuthPlugin } from "@/lib/plugins";
 import type { Adapter, AdapterUser } from "next-auth/adapters";
@@ -12,97 +13,119 @@ initializePlugins();
 async function generateUsername(email: string, name?: string | null): Promise<string> {
   // Try to use the part before @ in email
   let baseUsername = email.split("@")[0].toLowerCase().replace(/[^a-z0-9_]/g, "");
-  
+
   // If too short, use name
   if (baseUsername.length < 3 && name) {
     baseUsername = name.toLowerCase().replace(/[^a-z0-9_]/g, "").slice(0, 15);
   }
-  
+
   // Ensure minimum length
   if (baseUsername.length < 3) {
     baseUsername = "user";
   }
-  
+
   // Check if username exists and append number if needed
   let username = baseUsername;
   let counter = 1;
-  while (await db.user.findUnique({ where: { username } })) {
+  while (await usersCol().findOne({ username })) {
     username = `${baseUsername}${counter}`;
     counter++;
   }
-  
+
   return username;
 }
 
-// Custom adapter that wraps PrismaAdapter to add username
-function CustomPrismaAdapter(): Adapter {
-  const prismaAdapter = PrismaAdapter(db);
-  
+// Custom adapter that wraps MongoDBAdapter to add username
+function CustomMongoDBAdapter(): Adapter {
+  const mongoAdapter = MongoDBAdapter();
+
   return {
-    ...prismaAdapter,
+    ...mongoAdapter,
     async createUser(data: AdapterUser & { username?: string; githubUsername?: string }) {
       // Use GitHub username if provided, otherwise generate one
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let username = (data as any).username;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const githubUsername = (data as any).githubUsername; // Immutable GitHub username
-      
+
       if (!username) {
         username = await generateUsername(data.email, data.name);
       } else {
         username = username.toLowerCase();
-        
+
         // Check if there's an unclaimed account with this username
         const unclaimedEmail = `${username}@unclaimed.prompts.chat`;
-        const unclaimedUser = await db.user.findUnique({
-          where: { email: unclaimedEmail },
-        });
-        
+        const unclaimedUser = await usersCol().findOne({ email: unclaimedEmail });
+
         if (unclaimedUser) {
           // Claim this account - update with real user info
-          const claimedUser = await db.user.update({
-            where: { id: unclaimedUser.id },
-            data: {
-              name: data.name,
-              email: data.email,
-              avatar: data.image,
-              emailVerified: data.emailVerified,
-              githubUsername: githubUsername || undefined, // Store immutable GitHub username
+          const claimedUser = await usersCol().findOneAndUpdate(
+            { id: unclaimedUser.id },
+            {
+              $set: {
+                name: data.name,
+                email: data.email,
+                avatar: data.image,
+                emailVerified: data.emailVerified,
+                githubUsername: githubUsername || null,
+                updatedAt: new Date(),
+              },
             },
-          });
-          
+            { returnDocument: "after" }
+          );
+
+          if (!claimedUser) throw new Error("Failed to claim unclaimed user");
+
           return {
             ...claimedUser,
             image: claimedUser.avatar,
-          } as AdapterUser;
+          } as unknown as AdapterUser;
         }
-        
+
         // Ensure GitHub username is unique, append number if taken
         const baseUsername = username;
         let finalUsername = baseUsername;
         let counter = 1;
-        while (await db.user.findUnique({ where: { username: finalUsername } })) {
+        while (await usersCol().findOne({ username: finalUsername })) {
           finalUsername = `${baseUsername}${counter}`;
           counter++;
         }
         username = finalUsername;
       }
-      
-      const user = await db.user.create({
-        data: {
-          name: data.name,
-          email: data.email,
-          avatar: data.image,
-          emailVerified: data.emailVerified,
-          username,
-          githubUsername: githubUsername || undefined, // Store immutable GitHub username
-        },
-      });
-      
+
+      const now = new Date();
+      const newUser = {
+        id: crypto.randomUUID(),
+        name: data.name ?? null,
+        email: data.email,
+        avatar: data.image ?? null,
+        emailVerified: data.emailVerified ?? null,
+        username,
+        githubUsername: githubUsername || null,
+        role: "USER" as const,
+        locale: "en",
+        createdAt: now,
+        updatedAt: now,
+        verified: false,
+        flagged: false,
+        dailyGenerationLimit: 3,
+        generationCreditsRemaining: 3,
+        generationCreditsResetAt: null,
+        customLinks: [],
+        password: null,
+        bio: null,
+        apiKey: null,
+        mcpPromptsPublicByDefault: false,
+        flaggedAt: null,
+        flaggedReason: null,
+      };
+
+      await usersCol().insertOne(newUser as unknown as UserDocument);
+
       return {
-        ...user,
-        image: user.avatar,
-      } as AdapterUser;
+        ...newUser,
+        image: newUser.avatar,
+      } as unknown as AdapterUser;
     },
   };
 }
@@ -125,7 +148,7 @@ function getConfiguredProviders(config: Awaited<ReturnType<typeof getConfig>>): 
 async function buildAuthConfig() {
   const config = await getConfig();
   const providerIds = getConfiguredProviders(config);
-  
+
   const authProviders = providerIds
     .map((id) => {
       const plugin = getAuthPlugin(id);
@@ -142,7 +165,7 @@ async function buildAuthConfig() {
   }
 
   return {
-    adapter: CustomPrismaAdapter(),
+    adapter: CustomMongoDBAdapter(),
     providers: authProviders,
     session: {
       strategy: "jwt" as const,
@@ -157,10 +180,10 @@ async function buildAuthConfig() {
       async jwt({ token, user, trigger }: { token: any; user?: any; trigger?: string }) {
         // On sign in, look up the actual database user by email to ensure correct ID
         if (user && user.email) {
-          const dbUser = await db.user.findUnique({
-            where: { email: user.email },
-            select: { id: true, role: true, username: true, locale: true, name: true, avatar: true },
-          });
+          const dbUser = await usersCol().findOne(
+            { email: user.email },
+            { projection: { id: 1, role: 1, username: 1, locale: 1, name: 1, avatar: 1 } }
+          );
 
           if (dbUser) {
             token.id = dbUser.id;
@@ -174,10 +197,10 @@ async function buildAuthConfig() {
 
         // On subsequent requests, verify user exists and refresh data
         if (token.id && !user) {
-          const dbUser = await db.user.findUnique({
-            where: { id: token.id as string },
-            select: { id: true, role: true, username: true, locale: true, name: true, avatar: true },
-          });
+          const dbUser = await usersCol().findOne(
+            { id: token.id as string },
+            { projection: { id: 1, role: 1, username: 1, locale: 1, name: 1, avatar: 1 } }
+          );
 
           // User no longer exists - invalidate token
           if (!dbUser) {

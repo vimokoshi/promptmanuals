@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, usersCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
+import { randomUUID } from "crypto";
 
 const createVersionSchema = z.object({
   content: z.string().min(1, "Content is required"),
@@ -24,11 +26,21 @@ export async function POST(
 
     const { id: promptId } = await params;
 
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "not_found", message: "Prompt not found" },
+        { status: 404 }
+      );
+    }
+
     // Check if prompt exists and user is owner
-    const prompt = await db.prompt.findUnique({
-      where: { id: promptId },
-      select: { authorId: true, content: true },
-    });
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid },
+      { projection: { authorId: 1, content: 1, versions: 1 } }
+    );
 
     if (!prompt) {
       return NextResponse.json(
@@ -64,41 +76,48 @@ export async function POST(
       );
     }
 
-    // Get latest version number
-    const latestVersion = await db.promptVersion.findFirst({
-      where: { promptId },
-      orderBy: { version: "desc" },
-      select: { version: true },
-    });
+    // Get latest version number from embedded array
+    const versions = prompt.versions ?? [];
+    const latestVersionNum = versions.reduce(
+      (max, v) => Math.max(max, v.version),
+      0
+    );
+    const newVersionNumber = latestVersionNum + 1;
 
-    const newVersionNumber = (latestVersion?.version || 0) + 1;
+    const newVersion = {
+      _id: randomUUID(),
+      version: newVersionNumber,
+      content,
+      changeNote: changeNote ?? `Version ${newVersionNumber}`,
+      createdAt: new Date(),
+      createdBy: session.user.id,
+    };
 
-    // Create new version and update prompt content in a transaction
-    const [version] = await db.$transaction([
-      db.promptVersion.create({
-        data: {
-          promptId,
-          version: newVersionNumber,
-          content,
-          changeNote: changeNote || `Version ${newVersionNumber}`,
-          createdBy: session.user.id,
-        },
-        include: {
-          author: {
-            select: {
-              name: true,
-              username: true,
-            },
-          },
-        },
-      }),
-      db.prompt.update({
-        where: { id: promptId },
-        data: { content },
-      }),
-    ]);
+    // Push new version and update prompt content atomically
+    await promptsCol().updateOne(
+      { _id: promptOid },
+      {
+        $push: { versions: newVersion } as any,
+        $set: { content, updatedAt: new Date() },
+      }
+    );
 
-    return NextResponse.json(version, { status: 201 });
+    // Fetch author info for response
+    const author = await usersCol().findOne(
+      { _id: session.user.id as any },
+      { projection: { name: 1, username: 1 } }
+    );
+
+    return NextResponse.json(
+      {
+        ...newVersion,
+        id: newVersion._id,
+        author: author
+          ? { name: author.name, username: author.username }
+          : null,
+      },
+      { status: 201 }
+    );
   } catch (error) {
     console.error("Create version error:", error);
     return NextResponse.json(
@@ -116,20 +135,44 @@ export async function GET(
   try {
     const { id: promptId } = await params;
 
-    const versions = await db.promptVersion.findMany({
-      where: { promptId },
-      orderBy: { version: "desc" },
-      include: {
-        author: {
-          select: {
-            name: true,
-            username: true,
-          },
-        },
-      },
-    });
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      return NextResponse.json(
+        { error: "server_error", message: "Something went wrong" },
+        { status: 500 }
+      );
+    }
 
-    return NextResponse.json(versions);
+    const prompt = await promptsCol().findOne(
+      { _id: promptOid },
+      { projection: { versions: 1 } }
+    );
+
+    const versions = (prompt?.versions ?? []).slice().sort(
+      (a, b) => b.version - a.version
+    );
+
+    // Fetch all authors in one query
+    const authorIds = [...new Set(versions.map((v) => v.createdBy))];
+    const authors = await usersCol()
+      .find(
+        { _id: { $in: authorIds as any } },
+        { projection: { _id: 1, name: 1, username: 1 } }
+      )
+      .toArray();
+    const authorMap = new Map(
+      authors.map((a) => [a._id.toHexString(), { name: a.name, username: a.username }])
+    );
+
+    const result = versions.map((v) => ({
+      ...v,
+      id: v._id,
+      author: authorMap.get(v.createdBy) ?? null,
+    }));
+
+    return NextResponse.json(result);
   } catch (error) {
     console.error("Get versions error:", error);
     return NextResponse.json(
