@@ -2,8 +2,10 @@ import { redirect, notFound } from "next/navigation";
 import Link from "next/link";
 import { getTranslations } from "next-intl/server";
 import { ArrowLeft } from "lucide-react";
+import { ObjectId } from "mongodb";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 import { Button } from "@/components/ui/button";
 import { ChangeRequestForm } from "@/components/prompts/change-request-form";
 
@@ -25,7 +27,7 @@ function extractPromptId(idParam: string): string {
 export default async function NewChangeRequestPage({ params }: NewChangeRequestPageProps) {
   const session = await auth();
   const t = await getTranslations("changeRequests");
-  
+
   if (!session?.user) {
     redirect("/login");
   }
@@ -33,30 +35,28 @@ export default async function NewChangeRequestPage({ params }: NewChangeRequestP
   const { id: idParam } = await params;
   const id = extractPromptId(idParam);
 
-  const prompt = await db.prompt.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      title: true,
-      content: true,
-      type: true,
-      structuredFormat: true,
-      authorId: true,
-      isPrivate: true,
-    },
-  });
-
-  if (!prompt) {
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(id);
+  } catch {
     notFound();
   }
 
+  const doc = await promptsCol().findOne({ _id: oid });
+
+  if (!doc) {
+    notFound();
+  }
+
+  const promptId = docId(doc);
+
   // Can't create change request for own prompt
-  if (prompt.authorId === session.user.id) {
-    redirect(`/prompts/${id}`);
+  if (doc.authorId === session.user.id) {
+    redirect(`/prompts/${promptId}`);
   }
 
   // Can't create change request for private prompt
-  if (prompt.isPrivate) {
+  if (doc.isPrivate) {
     notFound();
   }
 
@@ -65,24 +65,24 @@ export default async function NewChangeRequestPage({ params }: NewChangeRequestP
       {/* Header */}
       <div className="mb-6">
         <Button variant="ghost" size="sm" asChild className="mb-4 -ml-2">
-          <Link href={`/prompts/${id}`}>
+          <Link href={`/prompts/${promptId}`}>
             <ArrowLeft className="h-4 w-4 mr-1.5" />
             {t("backToPrompt")}
           </Link>
         </Button>
         <h1 className="text-xl font-semibold">{t("create")}</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          {prompt.title}
+          {doc.title}
         </p>
       </div>
 
       {/* Form */}
-      <ChangeRequestForm 
-        promptId={prompt.id} 
-        currentContent={prompt.content}
-        currentTitle={prompt.title}
-        promptType={prompt.type}
-        structuredFormat={prompt.structuredFormat}
+      <ChangeRequestForm
+        promptId={promptId}
+        currentContent={doc.content}
+        currentTitle={doc.title}
+        promptType={doc.type}
+        structuredFormat={doc.structuredFormat}
       />
     </div>
   );

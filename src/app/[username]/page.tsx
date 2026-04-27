@@ -6,7 +6,8 @@ import { formatDistanceToNow } from "@/lib/date";
 import { getPromptUrl } from "@/lib/urls";
 import { Calendar, ArrowBigUp, FileText, Settings, GitPullRequest, Clock, Check, X, Pin, BadgeCheck, Users, ShieldCheck, Heart, ImageIcon } from "lucide-react";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, usersCol, pinnedPromptsCol, changeRequestsCol, commentsCol } from "@/lib/mongodb";
+import { formatPromptsForCard, docId, type PromptForCard } from "@/lib/mongodb/prompt-helpers";
 import config from "@/../prompts.config";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -28,18 +29,18 @@ interface UserProfilePageProps {
 export async function generateMetadata({ params }: UserProfilePageProps): Promise<Metadata> {
   const { username: rawUsername } = await params;
   const decodedUsername = decodeURIComponent(rawUsername);
-  
+
   // Only support /@username format
   if (!decodedUsername.startsWith("@")) {
     return { title: "User Not Found" };
   }
-  
+
   const username = decodedUsername.slice(1);
-    
-  const user = await db.user.findFirst({
-    where: { username: { equals: username, mode: "insensitive" } },
-    select: { name: true, username: true },
-  });
+
+  const user = await usersCol().findOne(
+    { username: { $regex: new RegExp(`^${username}$`, "i") } },
+    { projection: { name: 1, username: 1 } }
+  );
 
   if (!user) {
     return { title: "User Not Found" };
@@ -62,255 +63,236 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
 
   // Decode URL-encoded @ symbol
   const decodedUsername = decodeURIComponent(rawUsername);
-  
+
   // Only support /@username format - reject URLs without @
   if (!decodedUsername.startsWith("@")) {
     notFound();
   }
-  
+
   const username = decodedUsername.slice(1);
 
-  const user = await db.user.findFirst({
-    where: { username: { equals: username, mode: "insensitive" } },
-    select: {
-      id: true,
-      name: true,
-      username: true,
-      email: true,
-      avatar: true,
-      role: true,
-      verified: true,
-      createdAt: true,
-      bio: true,
-      customLinks: true,
-      _count: {
-        select: {
-          prompts: true,
-          contributions: true,
-        },
-      },
-    },
+  const userDoc = await usersCol().findOne({
+    username: { $regex: new RegExp(`^${username}$`, "i") },
   });
 
-  if (!user) {
+  if (!userDoc) {
     notFound();
   }
 
+  const userId = docId(userDoc);
   const page = Math.max(1, parseInt(pageParam || "1") || 1);
   const perPage = 24;
-  const isOwner = session?.user?.id === user.id;
-  const isUnclaimed = user.email?.endsWith("@unclaimed.prompts.chat") ?? false;
+  const isOwner = session?.user?.id === userId;
+  const isUnclaimed = userDoc.email?.endsWith("@unclaimed.prompts.chat") ?? false;
 
   // Parse date filter for filtering prompts by day (validate YYYY-MM-DD format)
   const isValidDateFilter = dateFilter && /^\d{4}-\d{2}-\d{2}$/.test(dateFilter);
   const filterDateStart = isValidDateFilter ? new Date(dateFilter + "T00:00:00") : null;
   const filterDateEnd = isValidDateFilter ? new Date(dateFilter + "T23:59:59") : null;
-  // Also verify the Date objects are valid (e.g., 2024-02-30 would fail)
   const validFilterDateStart = filterDateStart && !isNaN(filterDateStart.getTime()) ? filterDateStart : null;
   const validFilterDateEnd = filterDateEnd && !isNaN(filterDateEnd.getTime()) ? filterDateEnd : null;
 
-  // Build where clause - show private prompts only if owner (unlisted prompts are visible on profiles)
-  // Exclude intermediate flow prompts (only show first prompts or standalone)
-  // Note: "related" connections are AI-suggested similar prompts, not flow connections
-  const where = {
-    authorId: user.id,
+  // Build match for main prompts query
+  const promptsMatch: Record<string, unknown> = {
+    authorId: userId,
     deletedAt: null,
-    incomingConnections: { none: { label: { not: "related" } } },
     ...(isOwner ? {} : { isPrivate: false }),
-    ...(validFilterDateStart && validFilterDateEnd ? {
-      createdAt: {
-        gte: validFilterDateStart,
-        lte: validFilterDateEnd,
-      },
-    } : {}),
+    ...(validFilterDateStart && validFilterDateEnd
+      ? { createdAt: { $gte: validFilterDateStart, $lte: validFilterDateEnd } }
+      : {}),
   };
 
-  // Common prompt include for both queries
-  const promptInclude = {
-    author: {
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        avatar: true,
-        verified: true,
-      },
-    },
-    category: {
-      include: {
-        parent: {
-          select: { id: true, name: true, slug: true },
-        },
-      },
-    },
-    tags: {
-      include: {
-        tag: true,
-      },
-    },
-    _count: {
-      select: {
-        votes: true,
-        contributors: true,
-        outgoingConnections: { where: { label: { not: "related" } } },
-        incomingConnections: { where: { label: { not: "related" } } },
-      },
-    },
-  };
-
-  // Calculate date range for activity (last 12 months)
+  // Activity range: last 12 months
   const oneYearAgo = new Date();
   oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
   oneYearAgo.setHours(0, 0, 0, 0);
 
-  // Fetch prompts, pinned prompts, contributions, liked prompts, user examples, counts, and activity data
-  const [promptsRaw, total, totalUpvotes, pinnedPromptsRaw, contributionsRaw, likedPromptsRaw, userExamplesRaw, privatePromptsCount, activityPrompts, activityVotes, activityChangeRequests, activityComments] = await Promise.all([
-    db.prompt.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      skip: (page - 1) * perPage,
-      take: perPage,
-      include: promptInclude,
-    }),
-    db.prompt.count({ where }),
-    db.promptVote.count({
-      where: {
-        prompt: {
-          authorId: user.id,
-        },
-      },
-    }),
-    db.pinnedPrompt.findMany({
-      where: { userId: user.id },
-      orderBy: { order: "asc" },
-      include: {
-        prompt: {
-          include: promptInclude,
-        },
-      },
-    }),
-    // Fetch contributions (prompts where user is contributor but not author)
-    // Limited to 50 to prevent memory issues
-    db.prompt.findMany({
-      where: {
-        contributors: {
-          some: { id: user.id },
-        },
-        authorId: { not: user.id },
+  // Fetch all data in parallel
+  const [
+    promptDocs,
+    total,
+    pinnedPromptDocs,
+    contributionDocs,
+    likedDocs,
+    userExampleDocs,
+    privatePromptsCount,
+    activityPrompts,
+    activityVotes,
+    activityChangeRequests,
+    activityComments,
+    submittedChangeRequests,
+    receivedChangeRequests,
+    totalUpvotesResult,
+    promptCountAll,
+    contributionCount,
+  ] = await Promise.all([
+    // Main prompts (paginated)
+    promptsCol()
+      .find(promptsMatch)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * perPage)
+      .limit(perPage)
+      .toArray(),
+
+    // Total count for pagination
+    promptsCol().countDocuments(promptsMatch),
+
+    // Pinned prompts
+    pinnedPromptsCol()
+      .find({ userId })
+      .sort({ order: 1 })
+      .toArray(),
+
+    // Contributions: prompts where user has a version but is not the author
+    promptsCol()
+      .find({
+        "versions.createdBy": userId,
+        authorId: { $ne: userId },
         isPrivate: false,
         deletedAt: null,
-      },
-      orderBy: { updatedAt: "desc" },
-      take: 50,
-      include: promptInclude,
-    }),
-    // Fetch liked prompts (prompts user has voted for)
-    db.prompt.findMany({
-      where: {
-        votes: {
-          some: { userId: user.id },
-        },
+      })
+      .sort({ updatedAt: -1 })
+      .limit(50)
+      .toArray(),
+
+    // Liked prompts: prompts with embedded vote from this user
+    promptsCol()
+      .find({
+        "votes.userId": userId,
         isPrivate: false,
         deletedAt: null,
-      },
-      orderBy: { createdAt: "desc" },
-      take: 50,
-      include: promptInclude,
-    }),
-    // Fetch user's example media submissions (only their own examples, not original prompt media)
-    // Get the prompts that user has added examples to, including their specific example
-    db.prompt.findMany({
-      where: {
-        userExamples: {
-          some: { userId: user.id },
-        },
+      })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .toArray(),
+
+    // User examples: prompts where user submitted an example
+    promptsCol()
+      .find({
+        "userExamples.userId": userId,
         isPrivate: false,
         deletedAt: null,
-      },
-      orderBy: { createdAt: "desc" },
-      take: 50,
-      include: {
-        ...promptInclude,
-        userExamples: {
-          where: { userId: user.id },
-          take: 1,
-          orderBy: { createdAt: "desc" },
-          select: { mediaUrl: true },
-        },
-      },
-    }),
-    // Count private prompts (only relevant for owner)
-    isOwner ? db.prompt.count({
-      where: {
-        authorId: user.id,
-        isPrivate: true,
-        deletedAt: null,
-      },
-    }) : Promise.resolve(0),
+      })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .toArray(),
+
+    // Private prompts count (only relevant for owner)
+    isOwner
+      ? promptsCol().countDocuments({ authorId: userId, isPrivate: true, deletedAt: null })
+      : Promise.resolve(0),
+
     // Activity: prompts created in last year
-    db.prompt.findMany({
-      where: {
-        authorId: user.id,
-        createdAt: { gte: oneYearAgo },
-      },
-      select: { createdAt: true },
-    }),
-    // Activity: votes given in last year
-    db.promptVote.findMany({
-      where: {
-        userId: user.id,
-        createdAt: { gte: oneYearAgo },
-      },
-      select: { createdAt: true },
-    }),
-    // Activity: change requests in last year
-    db.changeRequest.findMany({
-      where: {
-        authorId: user.id,
-        createdAt: { gte: oneYearAgo },
-      },
-      select: { createdAt: true },
-    }),
-    // Activity: comments in last year
-    db.comment.findMany({
-      where: {
-        authorId: user.id,
-        createdAt: { gte: oneYearAgo },
-      },
-      select: { createdAt: true },
-    }),
+    promptsCol()
+      .find({ authorId: userId, createdAt: { $gte: oneYearAgo } })
+      .project({ createdAt: 1 })
+      .toArray(),
+
+    // Activity: votes cast in last year (embedded votes where userId matches)
+    // We aggregate to find all vote timestamps for this user across all prompts
+    promptsCol()
+      .aggregate([
+        { $match: { "votes.userId": userId } },
+        { $unwind: "$votes" },
+        { $match: { "votes.userId": userId, "votes.createdAt": { $gte: oneYearAgo } } },
+        { $project: { createdAt: "$votes.createdAt" } },
+      ])
+      .toArray(),
+
+    // Activity: change requests authored in last year
+    changeRequestsCol()
+      .find({ authorId: userId, createdAt: { $gte: oneYearAgo } })
+      .project({ createdAt: 1 })
+      .toArray(),
+
+    // Activity: comments authored in last year
+    commentsCol()
+      .find({ authorId: userId, createdAt: { $gte: oneYearAgo } })
+      .project({ createdAt: 1 })
+      .toArray(),
+
+    // Change requests submitted by user
+    changeRequestsCol()
+      .find({
+        authorId: userId,
+        ...(isOwner ? {} : { status: "APPROVED" }),
+      })
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .toArray(),
+
+    // Change requests received on user's prompts
+    changeRequestsCol()
+      .aggregate([
+        {
+          $lookup: {
+            from: "prompts",
+            localField: "promptId",
+            foreignField: "_id",
+            as: "promptDoc",
+            pipeline: [{ $project: { authorId: 1 } }],
+          },
+        },
+        { $unwind: "$promptDoc" },
+        {
+          $match: {
+            "promptDoc.authorId": userId,
+            authorId: { $ne: userId },
+            ...(isOwner ? {} : { status: "APPROVED" }),
+          },
+        },
+        { $sort: { createdAt: -1 } },
+        { $limit: 100 },
+      ])
+      .toArray(),
+
+    // Total upvotes received (sum of voteCount across all user's prompts)
+    promptsCol()
+      .aggregate([
+        { $match: { authorId: userId, deletedAt: null } },
+        { $group: { _id: null, total: { $sum: "$voteCount" } } },
+      ])
+      .toArray()
+      .then((r) => (r[0]?.total as number) ?? 0),
+
+    // Total prompt count (for profile stats — all non-deleted prompts)
+    promptsCol().countDocuments({ authorId: userId, deletedAt: null }),
+
+    // Contribution count (approved change requests authored by user)
+    changeRequestsCol().countDocuments({ authorId: userId, status: "APPROVED" }),
   ]);
 
-  // Transform to include voteCount and contributorCount
-  const prompts = promptsRaw.map((p) => ({
-    ...p,
-    voteCount: p._count?.votes ?? 0,
-    contributorCount: p._count?.contributors ?? 0,
-  }));
+  // Format prompts for cards
+  const [prompts, contributions, likedPrompts, userExamplesFormatted] = await Promise.all([
+    formatPromptsForCard(promptDocs),
+    formatPromptsForCard(contributionDocs),
+    formatPromptsForCard(likedDocs),
+    formatPromptsForCard(userExampleDocs),
+  ]);
 
-  // Transform contributions
-  const contributions = contributionsRaw.map((p) => ({
-    ...p,
-    voteCount: p._count?.votes ?? 0,
-    contributorCount: p._count?.contributors ?? 0,
-  }));
+  // Override userExample mediaUrl with user's specific example
+  const userExamples = userExamples_override(userExampleDocs, userExamplesFormatted, userId);
 
-  // Transform liked prompts
-  const likedPrompts = likedPromptsRaw.map((p) => ({
-    ...p,
-    voteCount: p._count?.votes ?? 0,
-    contributorCount: p._count?.contributors ?? 0,
-  }));
+  // Fetch pinned prompt docs
+  const pinnedPromptIds = pinnedPromptDocs.map((pp) => pp.promptId);
+  const pinnedPromptRawDocs = pinnedPromptIds.length > 0
+    ? await promptsCol()
+        .find({
+          _id: { $in: pinnedPromptIds } as Record<string, unknown>,
+          ...(isOwner ? {} : { isPrivate: false }),
+          deletedAt: null,
+        })
+        .toArray()
+    : [];
 
-  // Transform user examples (prompts where user added examples)
-  // Override mediaUrl with user's example mediaUrl
-  const userExamples = userExamplesRaw.map((p) => ({
-    ...p,
-    mediaUrl: p.userExamples?.[0]?.mediaUrl ?? p.mediaUrl,
-    userExamples: undefined, // Remove to avoid type conflict with PromptCard
-    voteCount: p._count?.votes ?? 0,
-    contributorCount: p._count?.contributors ?? 0,
-  }));
+  const pinnedPromptFormatted = await formatPromptsForCard(pinnedPromptRawDocs);
+
+  // Sort pinned prompts by order
+  const pinnedIdToOrder = new Map(pinnedPromptDocs.map((pp) => [pp.promptId, pp.order]));
+  const pinnedPrompts = pinnedPromptFormatted.sort(
+    (a, b) => (pinnedIdToOrder.get(a.id) ?? 0) - (pinnedIdToOrder.get(b.id) ?? 0)
+  );
+  const pinnedIds = new Set<string>(pinnedPrompts.map((p) => p.id));
 
   // Process activity data into daily counts
   const activityMap = new Map<string, number>();
@@ -320,9 +302,9 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
     ...activityChangeRequests,
     ...activityComments,
   ];
-  
+
   allActivities.forEach((item) => {
-    const dateStr = item.createdAt.toISOString().split("T")[0];
+    const dateStr = (item.createdAt as Date).toISOString().split("T")[0];
     activityMap.set(dateStr, (activityMap.get(dateStr) || 0) + 1);
   });
 
@@ -331,106 +313,90 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
     count,
   }));
 
-  // Transform pinned prompts - filter out private prompts for non-owners (unlisted are visible)
-  const pinnedPrompts = pinnedPromptsRaw
-    .filter((pp) => isOwner || !pp.prompt.isPrivate)
-    .map((pp) => ({
-      ...pp.prompt,
-      voteCount: pp.prompt._count?.votes ?? 0,
-      contributorCount: pp.prompt._count?.contributors ?? 0,
-    }));
+  // Fetch prompt details for change requests
+  const crPromptIds = [
+    ...new Set([
+      ...submittedChangeRequests.map((cr) => cr.promptId),
+      ...receivedChangeRequests.map((cr) => cr.promptId),
+    ]),
+  ];
+  const crPromptDocs = crPromptIds.length > 0
+    ? await promptsCol()
+        .find({ _id: { $in: crPromptIds } } as Record<string, unknown>)
+        .project({ _id: 1, slug: 1, title: 1, authorId: 1 })
+        .toArray()
+    : [];
+  const crPromptMap = new Map(crPromptDocs.map((p) => [docId(p as { _id: unknown }), p]));
 
-  // Get set of pinned prompt IDs for easy lookup
-  const pinnedIds = new Set<string>(pinnedPrompts.map((p: { id: string }) => p.id));
+  // Fetch authors for change requests
+  const crAuthorIds = [
+    ...new Set([
+      ...submittedChangeRequests.map((cr) => cr.authorId),
+      ...receivedChangeRequests.map((cr) => cr.authorId),
+    ]),
+  ];
+  const crAuthorDocs = crAuthorIds.length > 0
+    ? await usersCol()
+        .find({ _id: { $in: crAuthorIds } } as Record<string, unknown>)
+        .project({ _id: 1, name: 1, username: 1, avatar: 1 })
+        .toArray()
+    : [];
+  const crAuthorMap = new Map(crAuthorDocs.map((u) => [docId(u), u]));
 
-  const totalPages = Math.ceil(total / perPage);
+  // Fetch prompt authors for change requests
+  const crPromptAuthorIds = [...new Set(crPromptDocs.map((p) => (p as { authorId: string }).authorId))];
+  const crPromptAuthorDocs = crPromptAuthorIds.length > 0
+    ? await usersCol()
+        .find({ _id: { $in: crPromptAuthorIds } } as Record<string, unknown>)
+        .project({ _id: 1, name: 1, username: 1 })
+        .toArray()
+    : [];
+  const crPromptAuthorMap = new Map(crPromptAuthorDocs.map((u) => [docId(u), u]));
 
-  // Fetch change requests for this user
-  // 1. Change requests the user submitted (all statuses for owner, approved only for others)
-  // 2. Change requests received on user's prompts (approved ones)
-  // Limited to 100 each to prevent memory issues
-  const [submittedChangeRequests, receivedChangeRequests] = await Promise.all([
-    // CRs user submitted
-    db.changeRequest.findMany({
-      where: {
-        authorId: user.id,
-        // Non-owners only see approved CRs
-        ...(isOwner ? {} : { status: "APPROVED" }),
-      },
-      orderBy: { createdAt: "desc" },
-      take: 100,
-      include: {
-        author: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-            avatar: true,
-          },
-        },
-        prompt: {
-          select: {
-            id: true,
-            slug: true,
-            title: true,
-            author: {
-              select: {
-                id: true,
-                name: true,
-                username: true,
-              },
-            },
-          },
-        },
-      },
-    }),
-    // CRs received on user's prompts (all statuses for owner, approved only for others)
-    db.changeRequest.findMany({
-      where: {
-        prompt: {
-          authorId: user.id,
-        },
-        ...(isOwner ? {} : { status: "APPROVED" }),
-        authorId: { not: user.id }, // Exclude self-submitted
-      },
-      orderBy: { createdAt: "desc" },
-      take: 100,
-      include: {
-        author: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-            avatar: true,
-          },
-        },
-        prompt: {
-          select: {
-            id: true,
-            slug: true,
-            title: true,
-            author: {
-              select: {
-                id: true,
-                name: true,
-                username: true,
-              },
-            },
-          },
-        },
-      },
-    }),
-  ]);
+  // Assemble change request objects
+  const assembleChangeRequest = (cr: Record<string, unknown>, type: "submitted" | "received") => {
+    const promptDoc = crPromptMap.get(cr.promptId as string);
+    const promptAuthorDoc = promptDoc ? crPromptAuthorMap.get((promptDoc as { authorId: string }).authorId) : null;
+    const authorDoc = crAuthorMap.get(cr.authorId as string);
+    return {
+      id: docId(cr as { _id: unknown }),
+      status: cr.status as string,
+      createdAt: cr.createdAt as Date,
+      type,
+      author: authorDoc
+        ? { name: (authorDoc as { name?: string | null }).name ?? null, username: (authorDoc as { username: string }).username }
+        : { name: null, username: cr.authorId as string },
+      prompt: promptDoc
+        ? {
+            id: docId(promptDoc as { _id: unknown }),
+            slug: (promptDoc as { slug?: string | null }).slug ?? null,
+            title: (promptDoc as { title: string }).title,
+            author: promptAuthorDoc
+              ? { id: docId(promptAuthorDoc as { _id: unknown }), name: (promptAuthorDoc as { name?: string | null }).name ?? null, username: (promptAuthorDoc as { username: string }).username }
+              : { id: (promptDoc as { authorId: string }).authorId, name: null, username: (promptDoc as { authorId: string }).authorId },
+          }
+        : { id: cr.promptId as string, slug: null, title: "Unknown", author: { id: "", name: null, username: "" } },
+    };
+  };
 
-  // Combine and sort by date, marking the type
   const allChangeRequests = [
-    ...submittedChangeRequests.map((cr) => ({ ...cr, type: "submitted" as const })),
-    ...receivedChangeRequests.map((cr) => ({ ...cr, type: "received" as const })),
+    ...submittedChangeRequests.map((cr) => assembleChangeRequest(cr as unknown as Record<string, unknown>, "submitted")),
+    ...receivedChangeRequests.map((cr) => assembleChangeRequest(cr as unknown as Record<string, unknown>, "received")),
   ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-  const pendingCount = submittedChangeRequests.filter((cr) => cr.status === "PENDING").length +
-    receivedChangeRequests.filter((cr) => cr.status === "PENDING").length;
-  const defaultTab = tab === "changes" ? "changes" : tab === "contributions" ? "contributions" : tab === "likes" ? "likes" : tab === "examples" ? "examples" : "prompts";
+  const pendingCount =
+    submittedChangeRequests.filter((cr) => cr.status === "PENDING").length +
+    receivedChangeRequests.filter((cr) => (cr as { status?: string }).status === "PENDING").length;
+
+  const defaultTab =
+    tab === "changes" ? "changes"
+    : tab === "contributions" ? "contributions"
+    : tab === "likes" ? "likes"
+    : tab === "examples" ? "examples"
+    : "prompts";
+
+  const totalPages = Math.ceil(total / perPage);
+  const totalUpvotes = totalUpvotesResult as number;
 
   const statusColors = {
     PENDING: "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400 border-yellow-500/20",
@@ -451,18 +417,18 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
         {/* Avatar + Name row */}
         <div className="flex items-center gap-4">
           <Avatar className="h-16 w-16 md:h-20 md:w-20 shrink-0">
-            <AvatarImage src={user.avatar || undefined} />
+            <AvatarImage src={userDoc.avatar || undefined} />
             <AvatarFallback className="text-xl md:text-2xl">
-              {user.name?.charAt(0) || user.username.charAt(0)}
+              {userDoc.name?.charAt(0) || userDoc.username.charAt(0)}
             </AvatarFallback>
           </Avatar>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="text-xl md:text-2xl font-bold truncate">{user.name || user.username}</h1>
-              {user.verified && (
+              <h1 className="text-xl md:text-2xl font-bold truncate">{userDoc.name || userDoc.username}</h1>
+              {userDoc.verified && (
                 <BadgeCheck className="h-5 w-5 text-blue-500 shrink-0" />
               )}
-              {!user.verified && isOwner && !config.homepage?.useCloneBranding && (
+              {!userDoc.verified && isOwner && !config.homepage?.useCloneBranding && (
                 <Link
                   href="https://donate.stripe.com/aFa9AS5RJeAR23nej0dMI03"
                   target="_blank"
@@ -473,12 +439,12 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
                   {t("getVerified")}
                 </Link>
               )}
-              {user.role === "ADMIN" && (
+              {userDoc.role === "ADMIN" && (
                 <ShieldCheck className="h-5 w-5 text-primary shrink-0" />
               )}
             </div>
             <p className="text-muted-foreground text-sm flex items-center gap-2 flex-wrap">
-              @{user.username}
+              @{userDoc.username}
               {isUnclaimed && (
                 <Badge variant="outline" className="text-[10px] text-amber-600 border-amber-500/30 bg-amber-500/10">
                   {t("unclaimedUser")}
@@ -488,7 +454,7 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
           </div>
           {/* Actions - desktop only */}
           <div className="hidden md:flex items-center gap-2 shrink-0">
-            {config.features.mcp !== false && <McpServerPopup initialUsers={[user.username]} showOfficialBranding={!config.homepage?.useCloneBranding} />}
+            {config.features.mcp !== false && <McpServerPopup initialUsers={[userDoc.username]} showOfficialBranding={!config.homepage?.useCloneBranding} />}
             {isOwner && (
               <Button variant="outline" size="sm" asChild>
                 <Link href="/settings">
@@ -502,7 +468,7 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
 
         {/* Actions - mobile only */}
         <div className="md:hidden flex gap-2">
-          {config.features.mcp !== false && <McpServerPopup initialUsers={[user.username]} showOfficialBranding={!config.homepage?.useCloneBranding} />}
+          {config.features.mcp !== false && <McpServerPopup initialUsers={[userDoc.username]} showOfficialBranding={!config.homepage?.useCloneBranding} />}
           {isOwner && (
             <Button variant="outline" size="sm" asChild className="flex-1">
               <Link href="/settings">
@@ -514,9 +480,9 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
         </div>
 
         {/* Bio and Social Links */}
-        <ProfileLinks 
-          bio={user.bio} 
-          customLinks={user.customLinks as CustomLink[] | null}
+        <ProfileLinks
+          bio={userDoc.bio}
+          customLinks={userDoc.customLinks as CustomLink[] | null}
           className="mb-2"
         />
 
@@ -524,7 +490,7 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:gap-6 text-sm">
           <div className="flex items-center gap-1.5">
             <FileText className="h-4 w-4 text-muted-foreground" />
-            <span className="font-medium">{user._count.prompts}</span>
+            <span className="font-medium">{promptCountAll}</span>
             <span className="text-muted-foreground">{t("prompts").toLowerCase()}</span>
           </div>
           <div className="flex items-center gap-1.5">
@@ -534,16 +500,15 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
           </div>
           <div className="flex items-center gap-1.5">
             <Users className="h-4 w-4 text-muted-foreground" />
-            <span className="font-medium">{user._count.contributions}</span>
+            <span className="font-medium">{contributionCount}</span>
             <span className="text-muted-foreground">{t("contributionsCount")}</span>
           </div>
           <div className="flex items-center gap-1.5 text-muted-foreground">
             <Calendar className="h-4 w-4" />
-            <span>{t("joined")} {formatDistanceToNow(user.createdAt, locale)}</span>
+            <span>{t("joined")} {formatDistanceToNow(userDoc.createdAt, locale)}</span>
           </div>
         </div>
-
-        </div>
+      </div>
 
       {/* Activity Chart - above tabs */}
       <div className="mb-6">
@@ -552,7 +517,7 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
 
       {/* Tabs for Prompts and Change Requests */}
       <Tabs defaultValue={defaultTab} className="w-full">
-          <TabsList className="mb-4">
+        <TabsList className="mb-4">
           <TabsTrigger value="prompts" className="gap-2">
             <FileText className="h-4 w-4" />
             {t("prompts")}
@@ -603,8 +568,8 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
               <span className="text-sm">
                 {t("filteringByDate", { date: validFilterDateStart.toLocaleDateString(locale, { weekday: "long", year: "numeric", month: "long", day: "numeric" }) })}
               </span>
-              <Link 
-                href={`/@${user.username}`} 
+              <Link
+                href={`/@${userDoc.username}`}
                 className="ml-auto text-xs text-primary hover:underline"
               >
                 {t("clearFilter")}
@@ -726,15 +691,15 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
               {allChangeRequests.map((cr) => {
                 const StatusIcon = statusIcons[cr.status as keyof typeof statusIcons];
                 return (
-                  <Link 
-                    key={cr.id} 
+                  <Link
+                    key={cr.id}
                     href={`${getPromptUrl(cr.prompt.id, cr.prompt.slug)}/changes/${cr.id}`}
                     className="flex items-center justify-between px-3 py-2 hover:bg-accent/50 transition-colors"
                   >
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium truncate">{cr.prompt.title}</p>
                       <p className="text-xs text-muted-foreground">
-                        {cr.type === "submitted" 
+                        {cr.type === "submitted"
                           ? tChanges("submittedTo", { author: cr.prompt.author?.name || cr.prompt.author?.username })
                           : tChanges("receivedFrom", { author: cr.author.name || cr.author.username })
                         }
@@ -755,4 +720,20 @@ export default async function UserProfilePage({ params, searchParams }: UserProf
       </Tabs>
     </div>
   );
+}
+
+// Helper to override mediaUrl in formatted prompts with the user's specific example
+function userExamples_override(
+  rawDocs: Array<{ _id: unknown; userExamples?: Array<{ userId: string; mediaUrl: string }> }>,
+  formatted: PromptForCard[],
+  userId: string
+): PromptForCard[] {
+  return formatted.map((p, i) => {
+    const raw = rawDocs[i];
+    const example = raw?.userExamples?.find((e) => e.userId === userId);
+    if (example) {
+      return { ...p, mediaUrl: example.mediaUrl };
+    }
+    return p;
+  });
 }

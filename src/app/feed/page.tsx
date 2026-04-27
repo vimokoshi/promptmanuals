@@ -3,7 +3,8 @@ import { redirect } from "next/navigation";
 import { getTranslations } from "next-intl/server";
 import { ArrowRight, Bell, FolderOpen, Sparkles } from "lucide-react";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, categoriesCol, categorySubscriptionsCol } from "@/lib/mongodb";
+import { formatPromptsForCard, docId } from "@/lib/mongodb/prompt-helpers";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { PromptList } from "@/components/prompts/prompt-list";
@@ -18,81 +19,68 @@ export default async function FeedPage() {
   }
 
   // Get user's subscribed categories
-  const subscriptions = await db.categorySubscription.findMany({
-    where: { userId: session.user.id },
-    include: {
-      category: {
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-        },
-      },
+  const subscriptionDocs = await categorySubscriptionsCol()
+    .find({ userId: session.user.id })
+    .toArray();
+
+  const subscribedCategoryIds = subscriptionDocs.map((s) => s.categoryId);
+
+  // Resolve category details for subscribed categories
+  const subscribedCategories =
+    subscribedCategoryIds.length > 0
+      ? await categoriesCol()
+          .find({ _id: { $in: subscribedCategoryIds } } as Record<string, unknown>)
+          .project({ _id: 1, name: 1, slug: 1 })
+          .toArray()
+      : [];
+
+  const subscriptions = subscribedCategories.map((cat) => ({
+    categoryId: docId(cat),
+    category: {
+      id: docId(cat),
+      name: cat.name as string,
+      slug: cat.slug as string,
     },
-  });
-
-  const subscribedCategoryIds = subscriptions.map((s) => s.categoryId);
-
-  // Fetch prompts from subscribed categories
-  const promptsRaw = subscribedCategoryIds.length > 0
-    ? await db.prompt.findMany({
-        where: {
-          isPrivate: false,
-          isUnlisted: false,
-          deletedAt: null,
-          categoryId: { in: subscribedCategoryIds },
-        },
-        orderBy: { createdAt: "desc" },
-        take: 30,
-        include: {
-          author: {
-            select: {
-              id: true,
-              name: true,
-              username: true,
-              avatar: true,
-              verified: true,
-            },
-          },
-          category: {
-            include: {
-              parent: {
-                select: { id: true, name: true, slug: true },
-              },
-            },
-          },
-          tags: {
-            include: {
-              tag: true,
-            },
-          },
-          _count: {
-            select: {
-              votes: true,
-              contributors: true,
-              outgoingConnections: { where: { label: { not: "related" } } },
-              incomingConnections: { where: { label: { not: "related" } } },
-            },
-          },
-        },
-      })
-    : [];
-
-  const prompts = promptsRaw.map((p) => ({
-    ...p,
-    voteCount: p._count?.votes ?? 0,
-    contributorCount: p._count?.contributors ?? 0,
   }));
 
-  // Get all categories for subscription
-  const categories = await db.category.findMany({
-    orderBy: { name: "asc" },
-    include: {
-      _count: {
-        select: { prompts: true },
-      },
-    },
-  });
+  // Fetch prompts from subscribed categories
+  const promptDocs =
+    subscribedCategoryIds.length > 0
+      ? await promptsCol()
+          .find({
+            isPrivate: false,
+            isUnlisted: false,
+            deletedAt: null,
+            categoryId: { $in: subscribedCategoryIds },
+          })
+          .sort({ createdAt: -1 })
+          .limit(30)
+          .toArray()
+      : [];
+
+  const prompts = await formatPromptsForCard(promptDocs);
+
+  // Get all categories for subscription suggestions
+  const allCategoryDocs = await categoriesCol()
+    .find({})
+    .sort({ name: 1 })
+    .toArray();
+
+  // Get prompt counts per category
+  const countAgg = await promptsCol()
+    .aggregate([
+      { $match: { isPrivate: false, deletedAt: null } },
+      { $group: { _id: "$categoryId", count: { $sum: 1 } } },
+    ])
+    .toArray();
+  const countMap = new Map(countAgg.map((c) => [c._id as string, c.count as number]));
+
+  const categories = allCategoryDocs.map((cat) => ({
+    id: docId(cat),
+    name: cat.name,
+    slug: cat.slug,
+    _count: { prompts: countMap.get(docId(cat)) ?? 0 },
+  }));
 
   return (
     <div className="container py-6">

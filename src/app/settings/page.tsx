@@ -1,7 +1,9 @@
 import { redirect } from "next/navigation";
 import { getTranslations } from "next-intl/server";
+import { ObjectId } from "mongodb";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 import config from "@/../prompts.config";
 import { ProfileForm } from "@/components/settings/profile-form";
 import { ApiKeySettings } from "@/components/settings/api-key-settings";
@@ -15,25 +17,24 @@ export default async function SettingsPage() {
     redirect("/login");
   }
 
-  const user = await db.user.findUnique({
-    where: { id: session.user.id },
-    select: {
-      id: true,
-      name: true,
-      username: true,
-      email: true,
-      avatar: true,
-      verified: true,
-      apiKey: true,
-      mcpPromptsPublicByDefault: true,
-      bio: true,
-      customLinks: true,
-    },
-  });
+  const userDoc = await usersCol().findOne({ _id: new ObjectId(session.user.id) });
 
-  if (!user) {
+  if (!userDoc) {
     redirect("/login");
   }
+
+  const user = {
+    id: docId(userDoc),
+    name: userDoc.name,
+    username: userDoc.username,
+    email: userDoc.email,
+    avatar: userDoc.avatar,
+    verified: userDoc.verified,
+    apiKey: userDoc.apiKey,
+    mcpPromptsPublicByDefault: userDoc.mcpPromptsPublicByDefault,
+    bio: userDoc.bio,
+    customLinks: userDoc.customLinks as CustomLink[] | null,
+  };
 
   return (
     <div className="container max-w-2xl py-6">
@@ -45,12 +46,9 @@ export default async function SettingsPage() {
       </div>
 
       <div className="space-y-6">
-        <ProfileForm 
-          user={{
-            ...user,
-            customLinks: user.customLinks as CustomLink[] | null,
-          }} 
-          showVerifiedSection={!config.homepage?.useCloneBranding} 
+        <ProfileForm
+          user={user}
+          showVerifiedSection={!config.homepage?.useCloneBranding}
         />
 
         {config.features.mcp !== false && (

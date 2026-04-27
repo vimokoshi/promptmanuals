@@ -1,31 +1,21 @@
 import { DiscoveryPrompts } from "@/components/prompts/discovery-prompts";
 import { StructuredData } from "@/components/seo/structured-data";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 
 export default async function DiscoverPage() {
   // Fetch top prompts for structured data
-  const topPrompts = await db.prompt.findMany({
-    where: {
-      isPrivate: false,
-      isUnlisted: false,
-      deletedAt: null,
-    },
-    orderBy: {
-      votes: { _count: "desc" },
-    },
-    take: 10,
-    select: {
-      id: true,
-      title: true,
-      description: true,
-      slug: true,
-    },
-  });
+  const topDocs = await promptsCol()
+    .find({ isPrivate: false, isUnlisted: false, deletedAt: null })
+    .sort({ voteCount: -1 })
+    .limit(10)
+    .project({ _id: 1, title: 1, description: 1, slug: 1 })
+    .toArray();
 
-  const itemListData = topPrompts.map((prompt) => ({
-    name: prompt.title,
-    url: `/prompts/${prompt.id}${prompt.slug ? `_${prompt.slug}` : ""}`,
-    description: prompt.description || undefined,
+  const itemListData = topDocs.map((prompt) => ({
+    name: prompt.title as string,
+    url: `/prompts/${docId(prompt)}${prompt.slug ? `_${prompt.slug}` : ""}`,
+    description: (prompt.description as string | null) || undefined,
   }));
 
   return (

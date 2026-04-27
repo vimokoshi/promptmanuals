@@ -3,8 +3,10 @@ import Link from "next/link";
 import { getTranslations, getLocale } from "next-intl/server";
 import { formatDistanceToNow } from "@/lib/date";
 import { ArrowLeft, Clock, Check, X, FileText } from "lucide-react";
+import { ObjectId } from "mongodb";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { changeRequestsCol, promptsCol, usersCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -36,46 +38,80 @@ export default async function ChangeRequestPage({ params }: ChangeRequestPagePro
   const { id: idParam, changeId } = await params;
   const promptId = extractPromptId(idParam);
 
-  const changeRequest = await db.changeRequest.findUnique({
-    where: { id: changeId },
-    include: {
-      author: {
-        select: {
-          id: true,
-          name: true,
-          username: true,
-          avatar: true,
-        },
-      },
-      prompt: {
-        select: {
-          id: true,
-          title: true,
-          content: true,
-          authorId: true,
-          type: true,
-        },
-      },
-    },
-  });
-
-  if (!changeRequest || changeRequest.prompt.id !== promptId) {
+  let changeOid: ObjectId;
+  try {
+    changeOid = new ObjectId(changeId);
+  } catch {
     notFound();
   }
 
-  const isPromptOwner = session?.user?.id === changeRequest.prompt.authorId;
-  const isChangeRequestAuthor = session?.user?.id === changeRequest.author.id;
+  const changeRequest = await changeRequestsCol().findOne({ _id: changeOid });
+
+  if (!changeRequest) {
+    notFound();
+  }
+
+  // Verify this change request belongs to the correct prompt
+  if (changeRequest.promptId !== promptId) {
+    // Try to look up by ObjectId too in case promptId is stored differently
+    let promptOid: ObjectId;
+    try {
+      promptOid = new ObjectId(promptId);
+    } catch {
+      notFound();
+    }
+    const promptDoc = await promptsCol().findOne({ _id: promptOid });
+    if (!promptDoc || changeRequest.promptId !== docId(promptDoc)) {
+      notFound();
+    }
+  }
+
+  // Fetch author and prompt details in parallel
+  const [authorDoc, promptDoc] = await Promise.all([
+    usersCol().findOne({ _id: { $in: [changeRequest.authorId] } } as Record<string, unknown>),
+    promptsCol().findOne({ _id: { $in: [changeRequest.promptId] } } as Record<string, unknown>),
+  ]);
+
+  if (!promptDoc) {
+    notFound();
+  }
+
+  const changeRequestId = docId(changeRequest);
+  const author = authorDoc
+    ? {
+        id: docId(authorDoc),
+        name: authorDoc.name,
+        username: authorDoc.username,
+        avatar: authorDoc.avatar,
+      }
+    : {
+        id: changeRequest.authorId,
+        name: null,
+        username: changeRequest.authorId,
+        avatar: null,
+      };
+
+  const prompt = {
+    id: docId(promptDoc),
+    title: promptDoc.title,
+    content: promptDoc.content,
+    authorId: promptDoc.authorId,
+    type: promptDoc.type,
+  };
+
+  const isPromptOwner = session?.user?.id === prompt.authorId;
+  const isChangeRequestAuthor = session?.user?.id === author.id;
 
   const statusConfig = {
-    PENDING: { 
+    PENDING: {
       color: "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400 border-yellow-500/20",
       icon: Clock,
     },
-    APPROVED: { 
+    APPROVED: {
       color: "bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20",
       icon: Check,
     },
-    REJECTED: { 
+    REJECTED: {
       color: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20",
       icon: X,
     },
@@ -105,12 +141,12 @@ export default async function ChangeRequestPage({ params }: ChangeRequestPagePro
                 {t(changeRequest.status.toLowerCase())}
               </Badge>
             </div>
-            <Link 
-              href={`/prompts/${promptId}`} 
+            <Link
+              href={`/prompts/${promptId}`}
               className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1.5 mt-1"
             >
               <FileText className="h-3.5 w-3.5" />
-              {changeRequest.prompt.title}
+              {prompt.title}
             </Link>
           </div>
         </div>
@@ -118,12 +154,12 @@ export default async function ChangeRequestPage({ params }: ChangeRequestPagePro
         {/* Author and time */}
         <div className="flex items-center gap-2 mt-4 pt-4 border-t">
           <Avatar className="h-6 w-6">
-            <AvatarImage src={changeRequest.author.avatar || ""} />
-            <AvatarFallback className="text-xs">{changeRequest.author.name?.[0] || changeRequest.author.username[0]}</AvatarFallback>
+            <AvatarImage src={author.avatar || ""} />
+            <AvatarFallback className="text-xs">{author.name?.[0] || author.username[0]}</AvatarFallback>
           </Avatar>
           <span className="text-sm">
-            <Link href={`/@${changeRequest.author.username}`} className="font-medium hover:underline">
-              @{changeRequest.author.username}
+            <Link href={`/@${author.username}`} className="font-medium hover:underline">
+              @{author.username}
             </Link>
             <span className="text-muted-foreground"> · {formatDistanceToNow(changeRequest.createdAt, locale)}</span>
           </span>
@@ -153,7 +189,7 @@ export default async function ChangeRequestPage({ params }: ChangeRequestPagePro
       {/* Content diff */}
       <div className="mb-6">
         <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-2">{t("contentChanges")}</p>
-        {changeRequest.prompt.type === "SKILL" ? (
+        {prompt.type === "SKILL" ? (
           <SkillDiffViewer
             original={changeRequest.originalContent}
             modified={changeRequest.proposedContent}
@@ -177,21 +213,21 @@ export default async function ChangeRequestPage({ params }: ChangeRequestPagePro
       {/* Actions for prompt owner */}
       {isPromptOwner && changeRequest.status === "PENDING" && (
         <div className="pt-4 border-t">
-          <ChangeRequestActions changeRequestId={changeRequest.id} promptId={promptId} />
+          <ChangeRequestActions changeRequestId={changeRequestId} promptId={promptId} />
         </div>
       )}
 
       {/* Reopen button for rejected requests */}
       {isPromptOwner && changeRequest.status === "REJECTED" && (
         <div className="pt-4 border-t">
-          <ReopenChangeRequestButton changeRequestId={changeRequest.id} promptId={promptId} />
+          <ReopenChangeRequestButton changeRequestId={changeRequestId} promptId={promptId} />
         </div>
       )}
 
       {/* Dismiss button for change request author (pending only) */}
       {isChangeRequestAuthor && changeRequest.status === "PENDING" && (
         <div className="pt-4 border-t">
-          <DismissChangeRequestButton changeRequestId={changeRequest.id} promptId={promptId} />
+          <DismissChangeRequestButton changeRequestId={changeRequestId} promptId={promptId} />
         </div>
       )}
     </div>

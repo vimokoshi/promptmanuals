@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { promptsCol, usersCol, categoriesCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
+import type { UserDocument, CategoryDocument } from "@/lib/mongodb";
 import crypto from "crypto";
 
 function getUserIdentifier(user: {
@@ -45,12 +47,14 @@ export async function GET(request: NextRequest) {
 
     // Fetch total count and latest updatedAt for ETag generation
     const [totalCount, latestPrompt] = await Promise.all([
-      db.prompt.count({ where: whereClause }),
-      db.prompt.findFirst({
-        where: whereClause,
-        orderBy: { updatedAt: "desc" },
-        select: { updatedAt: true },
-      }),
+      promptsCol().countDocuments(whereClause),
+      promptsCol()
+        .find(whereClause)
+        .sort({ updatedAt: -1 })
+        .limit(1)
+        .project({ updatedAt: 1 })
+        .toArray()
+        .then(arr => arr[0] ?? null),
     ]);
 
     // Generate and check ETag for conditional requests
@@ -68,141 +72,109 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    const selectClause = {
-      id: true,
-      title: true,
-      slug: true,
-      description: true,
-      content: true,
-      type: true,
-      mediaUrl: true,
-      viewCount: true,
-      createdAt: true,
-      updatedAt: true,
-      structuredFormat: true,
-      isFeatured: true,
-      featuredAt: true,
-      requiresMediaUpload: true,
-      requiredMediaType: true,
-      requiredMediaCount: true,
-      category: {
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-          icon: true,
-        },
-      },
-      author: {
-        select: {
-          username: true,
-          name: true,
-          avatar: true,
-          githubUsername: true,
-          verified: true,
-        },
-      },
-      contributors: {
-        select: {
-          username: true,
-          name: true,
-          avatar: true,
-          githubUsername: true,
-          verified: true,
-        },
-      },
-      tags: {
-        select: {
-          tag: {
-            select: {
-              id: true,
-              name: true,
-              slug: true,
-              color: true,
-            },
-          },
-        },
-      },
-      _count: {
-        select: {
-          votes: true,
-          comments: true,
-        },
-      },
-    } as const;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const queryOptions: any = {
-      where: whereClause,
-      select: selectClause,
-      orderBy: { createdAt: "desc" as const },
-    };
+    const query = promptsCol().find(whereClause).sort({ createdAt: -1 });
 
     if (isPaginated) {
-      queryOptions.skip = (page - 1) * limit;
-      queryOptions.take = limit;
+      query.skip((page - 1) * limit).limit(limit);
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const prompts: any[] = await db.prompt.findMany(queryOptions);
+    const docs = await query.toArray();
 
-    const includeFullContent = fullContent;
+    if (docs.length === 0) {
+      const responseBody = isPaginated
+        ? { count: 0, page, limit, totalPages: 1, hasMore: false, prompts: [] }
+        : { count: 0, prompts: [] };
+      return NextResponse.json(responseBody, {
+        headers: {
+          "Cache-Control": "public, max-age=3600, s-maxage=3600, stale-while-revalidate=86400",
+          ETag: etag,
+        },
+      });
+    }
 
-    const formattedPrompts = prompts.map((prompt) => {
-      const content = prompt.content ?? "";
+    // Batch-fetch authors
+    const authorIds = [...new Set(docs.map(d => d.authorId))];
+    const authorDocs = await usersCol()
+      .find({ _id: { $in: authorIds } } as Record<string, unknown>)
+      .project({ _id: 1, username: 1, name: 1, avatar: 1, githubUsername: 1, verified: 1 })
+      .toArray();
+    const authorMap = new Map<string, UserDocument>(
+      authorDocs.map(u => [(u._id as ObjectId).toHexString(), u as unknown as UserDocument])
+    );
+
+    // Batch-fetch categories
+    const categoryIds = [
+      ...new Set(docs.map(d => d.categoryId).filter(Boolean)),
+    ] as string[];
+    const categoryDocs = categoryIds.length > 0
+      ? await categoriesCol()
+          .find({ _id: { $in: categoryIds } } as Record<string, unknown>)
+          .project({ _id: 1, name: 1, slug: 1, icon: 1 })
+          .toArray()
+      : [];
+    const categoryMap = new Map<string, CategoryDocument>(
+      categoryDocs.map(c => [(c._id as ObjectId).toHexString(), c as unknown as CategoryDocument])
+    );
+
+    const formattedPrompts = docs.map(doc => {
+      const id = doc._id.toHexString();
+      const content = doc.content ?? "";
       const contentPreview =
         content.length > CONTENT_PREVIEW_LENGTH
           ? content.slice(0, CONTENT_PREVIEW_LENGTH) + "..."
           : content;
 
+      const author = authorMap.get(doc.authorId);
+      const category = doc.categoryId ? categoryMap.get(doc.categoryId) ?? null : null;
+
       return {
-        id: prompt.id,
-        title: prompt.title,
-        slug: prompt.slug,
-        description: prompt.description,
-        ...(includeFullContent
-          ? { content, contentPreview }
-          : { contentPreview }),
-        type: prompt.type,
-        structuredFormat: prompt.structuredFormat,
-        mediaUrl: prompt.mediaUrl,
-        viewCount: prompt.viewCount,
-        voteCount: prompt._count.votes,
-        commentCount: prompt._count.comments,
-        isFeatured: prompt.isFeatured,
-        featuredAt: prompt.featuredAt,
-        requiresMediaUpload: prompt.requiresMediaUpload,
-        requiredMediaType: prompt.requiredMediaType,
-        requiredMediaCount: prompt.requiredMediaCount,
-        createdAt: prompt.createdAt,
-        updatedAt: prompt.updatedAt,
-        category: prompt.category
+        id,
+        title: doc.title,
+        slug: doc.slug,
+        description: doc.description,
+        ...(fullContent ? { content, contentPreview } : { contentPreview }),
+        type: doc.type,
+        structuredFormat: doc.structuredFormat,
+        mediaUrl: doc.mediaUrl,
+        viewCount: doc.viewCount,
+        voteCount: doc.voteCount,
+        commentCount: 0,
+        isFeatured: doc.isFeatured,
+        featuredAt: doc.featuredAt,
+        requiresMediaUpload: doc.requiresMediaUpload,
+        requiredMediaType: doc.requiredMediaType,
+        requiredMediaCount: doc.requiredMediaCount,
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt,
+        category: category
           ? {
-              id: prompt.category.id,
-              name: prompt.category.name,
-              slug: prompt.category.slug,
-              icon: prompt.category.icon,
+              id: (category._id as ObjectId).toHexString(),
+              name: category.name,
+              slug: category.slug,
+              icon: category.icon,
             }
           : null,
-        author: {
-          username: prompt.author.username,
-          name: prompt.author.name,
-          avatar: prompt.author.avatar,
-          identifier: getUserIdentifier(prompt.author),
-          verified: prompt.author.verified,
-        },
-        contributors: prompt.contributors.map((c: { username: string; name: string | null; avatar: string | null; verified: boolean; githubUsername: string | null }) => ({
-          username: c.username,
-          name: c.name,
-          avatar: c.avatar,
-          identifier: getUserIdentifier(c),
-          verified: c.verified,
-        })),
-        tags: prompt.tags.map((pt: { tag: { id: string; name: string; slug: string; color: string } }) => ({
-          id: pt.tag.id,
-          name: pt.tag.name,
-          slug: pt.tag.slug,
-          color: pt.tag.color,
+        author: author
+          ? {
+              username: author.username,
+              name: author.name,
+              avatar: author.avatar,
+              identifier: getUserIdentifier(author),
+              verified: author.verified,
+            }
+          : {
+              username: doc.authorId,
+              name: null,
+              avatar: null,
+              identifier: doc.authorId,
+              verified: false,
+            },
+        contributors: [],
+        tags: doc.tags.map(t => ({
+          id: t._id,
+          name: t.name,
+          slug: t.slug,
+          color: t.color,
         })),
       };
     });

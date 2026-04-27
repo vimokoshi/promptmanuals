@@ -2,33 +2,33 @@ import Link from "next/link";
 import { getTranslations } from "next-intl/server";
 import { unstable_cache } from "next/cache";
 import { Tag } from "lucide-react";
-import { db } from "@/lib/db";
+import { tagsCol, promptsCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 
 // Cached tags query
 const getTags = unstable_cache(
   async () => {
-    return db.tag.findMany({
-      include: {
-        _count: {
-          select: {
-            prompts: {
-              where: {
-                prompt: {
-                  isPrivate: false,
-                  isUnlisted: false,
-                  deletedAt: null,
-                },
-              },
-            },
-          },
-        },
-      },
-      orderBy: {
-        prompts: {
-          _count: "desc",
-        },
-      },
-    });
+    const [tags, tagCounts] = await Promise.all([
+      tagsCol().find({}).sort({ name: 1 }).toArray(),
+      promptsCol().aggregate([
+        { $match: { isPrivate: false, isUnlisted: false, deletedAt: null } },
+        { $unwind: "$tags" },
+        { $group: { _id: "$tags.slug", count: { $sum: 1 } } },
+      ]).toArray(),
+    ]);
+
+    const countMap = new Map(tagCounts.map((t) => [t._id as string, t.count as number]));
+
+    // Sort by prompt count descending
+    return tags
+      .map((t) => ({
+        id: docId(t),
+        name: t.name,
+        slug: t.slug,
+        color: t.color,
+        promptCount: countMap.get(t.slug) ?? 0,
+      }))
+      .sort((a, b) => b.promptCount - a.promptCount);
   },
   ["tags-page"],
   { tags: ["tags"] }
@@ -60,20 +60,20 @@ export default async function TagsPage() {
               href={`/tags/${tag.slug}`}
               prefetch={false}
               className="group inline-flex items-center gap-2 px-3 py-1.5 rounded-full border transition-colors hover:border-foreground/30"
-              style={{ 
+              style={{
                 backgroundColor: tag.color + "10",
                 borderColor: tag.color + "30",
               }}
             >
-              <span 
-                className="w-2 h-2 rounded-full" 
+              <span
+                className="w-2 h-2 rounded-full"
                 style={{ backgroundColor: tag.color }}
               />
               <span className="text-sm font-medium group-hover:underline">
                 {tag.name}
               </span>
               <span className="text-xs text-muted-foreground">
-                {tag._count.prompts}
+                {tag.promptCount}
               </span>
             </Link>
           ))}

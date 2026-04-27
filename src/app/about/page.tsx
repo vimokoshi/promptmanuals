@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import Image from "next/image";
 import Link from "next/link";
 import { ExternalLink, Heart } from "lucide-react";
-import { db } from "@/lib/db";
+import { usersCol, promptsCol, changeRequestsCol } from "@/lib/mongodb";
 import { ContributorAvatar } from "./contributor-avatar";
 import config from "@/../prompts.config";
 
@@ -21,54 +21,67 @@ export async function generateMetadata(): Promise<Metadata> {
 
 async function getContributors() {
   // Get unclaimed users (original GitHub contributors from CSV import)
-  const unclaimedUsers = await db.user.findMany({
-    where: {
-      email: { endsWith: "@unclaimed.prompts.chat" },
-      username: { notIn: excludedFromCommunity },
-    },
-    select: {
-      id: true,
-      username: true,
-      githubUsername: true,
-      _count: {
-        select: {
-          prompts: true,
-          contributions: true,
-        },
-      },
-    },
-  });
+  const unclaimedUsers = await usersCol()
+    .find({
+      email: { $regex: "@unclaimed\\.prompts\\.chat$" },
+      username: { $nin: excludedFromCommunity },
+    })
+    .project({ _id: 1, username: 1, githubUsername: 1 })
+    .toArray();
 
-  // Get GitHub-authenticated users with contributions
-  const githubUsers = await db.user.findMany({
-    where: {
-      githubUsername: { not: null, notIn: excludedFromCommunity },
-      email: { not: { endsWith: "@unclaimed.prompts.chat" } },
-      OR: [
-        { prompts: { some: {} } },
-        { contributions: { some: {} } },
-      ],
-    },
-    select: {
-      id: true,
-      username: true,
-      githubUsername: true,
-      _count: {
-        select: {
-          prompts: true,
-          contributions: true,
-        },
-      },
-    },
-  });
+  // Get GitHub-authenticated users (non-unclaimed) with a githubUsername
+  const githubUsers = await usersCol()
+    .find({
+      githubUsername: { $ne: null, $nin: excludedFromCommunity },
+      email: { $not: { $regex: "@unclaimed\\.prompts\\.chat$" } },
+    })
+    .project({ _id: 1, username: 1, githubUsername: 1 })
+    .toArray();
 
   const allUsers = [...unclaimedUsers, ...githubUsers];
-  
-  return allUsers.sort((a, b) => {
-    const aTotal = a._count.prompts + a._count.contributions;
-    const bTotal = b._count.prompts + b._count.contributions;
-    return bTotal - aTotal;
-  });
+  if (allUsers.length === 0) return [];
+
+  // Collect all user IDs as strings for aggregation
+  const allUserIds = allUsers.map((u) => u._id.toHexString());
+
+  // Count prompts per user
+  const promptCounts = await promptsCol()
+    .aggregate<{ _id: string; count: number }>([
+      { $match: { authorId: { $in: allUserIds } } },
+      { $group: { _id: "$authorId", count: { $sum: 1 } } },
+    ])
+    .toArray();
+
+  // Count change requests (contributions) per user
+  const contributionCounts = await changeRequestsCol()
+    .aggregate<{ _id: string; count: number }>([
+      { $match: { authorId: { $in: allUserIds } } },
+      { $group: { _id: "$authorId", count: { $sum: 1 } } },
+    ])
+    .toArray();
+
+  const promptCountMap = new Map(promptCounts.map((r) => [r._id, r.count]));
+  const contributionCountMap = new Map(contributionCounts.map((r) => [r._id, r.count]));
+
+  // For GitHub-authenticated users, filter to those with at least one prompt or contribution
+  const githubUserIds = new Set(githubUsers.map((u) => u._id.toHexString()));
+
+  const enriched = allUsers
+    .map((u) => {
+      const id = u._id.toHexString();
+      const prompts = promptCountMap.get(id) ?? 0;
+      const contributions = contributionCountMap.get(id) ?? 0;
+      return { id, username: u.username, githubUsername: u.githubUsername, prompts, contributions };
+    })
+    .filter((u) => {
+      // Unclaimed users are always included; GitHub users only if they have activity
+      if (githubUserIds.has(u.id)) {
+        return u.prompts > 0 || u.contributions > 0;
+      }
+      return true;
+    });
+
+  return enriched.sort((a, b) => (b.prompts + b.contributions) - (a.prompts + a.contributions));
 }
 
 const techStack = [

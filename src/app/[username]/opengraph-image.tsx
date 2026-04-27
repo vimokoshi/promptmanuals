@@ -1,5 +1,6 @@
 import { ImageResponse } from "next/og";
-import { db } from "@/lib/db";
+import { usersCol, promptsCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 import { getConfig } from "@/lib/config";
 
 export const alt = "User Profile";
@@ -48,22 +49,9 @@ export default async function OGImage({ params }: { params: Promise<{ username: 
   }
   const username = decodedUsername.slice(1);
 
-  const user = await db.user.findFirst({
-    where: { username: { equals: username, mode: "insensitive" } },
-    select: {
-      id: true,
-      name: true,
-      username: true,
-      avatar: true,
-      role: true,
-      createdAt: true,
-      _count: {
-        select: {
-          prompts: true,
-        },
-      },
-    },
-  });
+  const user = await usersCol().findOne(
+    { username: { $regex: new RegExp(`^${username}$`, "i") } },
+  );
 
   if (!user) {
     return new ImageResponse(
@@ -88,14 +76,17 @@ export default async function OGImage({ params }: { params: Promise<{ username: 
     );
   }
 
-  // Get total upvotes received
-  const totalUpvotes = await db.promptVote.count({
-    where: {
-      prompt: {
-        authorId: user.id,
-      },
-    },
-  });
+  const userId = docId(user);
+
+  // Get prompt count and total upvotes in parallel
+  const [promptCount, totalUpvotes] = await Promise.all([
+    promptsCol().countDocuments({ authorId: userId, isPrivate: false, deletedAt: null }),
+    promptsCol().aggregate([
+      { $match: { authorId: userId, deletedAt: null } },
+      { $project: { voteCount: 1 } },
+      { $group: { _id: null, total: { $sum: "$voteCount" } } },
+    ]).toArray().then((r) => (r[0]?.total as number) ?? 0),
+  ]);
 
   // Format join date
   const joinDate = new Intl.DateTimeFormat("en-US", {
@@ -245,7 +236,7 @@ export default async function OGImage({ params }: { params: Promise<{ username: 
                   <path d="M14 2v4a2 2 0 0 0 2 2h4" />
                 </svg>
                 <span style={{ fontSize: 26, fontWeight: 600, color: "#18181b" }}>
-                  {user._count.prompts}
+                  {promptCount}
                 </span>
                 <span style={{ fontSize: 22, color: "#71717a" }}>
                   prompts

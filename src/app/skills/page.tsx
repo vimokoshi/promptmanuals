@@ -5,7 +5,8 @@ import { unstable_cache } from "next/cache";
 import { Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { InfinitePromptList } from "@/components/prompts/infinite-prompt-list";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
+import { formatPromptsForCard } from "@/lib/mongodb/prompt-helpers";
 
 export const metadata: Metadata = {
   title: "Skills",
@@ -15,15 +16,15 @@ export const metadata: Metadata = {
 // Query for skills list (cached)
 function getCachedSkills(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  orderBy: any,
+  sort: { field: string; order: 1 | -1 },
   perPage: number,
   searchQuery?: string
 ) {
-  const cacheKey = JSON.stringify({ orderBy, perPage, searchQuery });
-  
+  const cacheKey = JSON.stringify({ sort, perPage, searchQuery });
+
   return unstable_cache(
     async () => {
-      const where: Record<string, unknown> = {
+      const filter: Record<string, unknown> = {
         type: "SKILL",
         isPrivate: false,
         isUnlisted: false,
@@ -31,72 +32,25 @@ function getCachedSkills(
       };
 
       if (searchQuery) {
-        where.OR = [
-          { title: { contains: searchQuery, mode: "insensitive" } },
-          { content: { contains: searchQuery, mode: "insensitive" } },
-          { description: { contains: searchQuery, mode: "insensitive" } },
+        filter.$or = [
+          { title: { $regex: searchQuery, $options: "i" } },
+          { content: { $regex: searchQuery, $options: "i" } },
+          { description: { $regex: searchQuery, $options: "i" } },
         ];
       }
 
-      const [skillsRaw, totalCount] = await Promise.all([
-        db.prompt.findMany({
-          where,
-          orderBy,
-          skip: 0,
-          take: perPage,
-          include: {
-            author: {
-              select: {
-                id: true,
-                name: true,
-                username: true,
-                avatar: true,
-                verified: true,
-              },
-            },
-            category: {
-              include: {
-                parent: {
-                  select: { id: true, name: true, slug: true },
-                },
-              },
-            },
-            tags: {
-              include: {
-                tag: true,
-              },
-            },
-            contributors: {
-              select: {
-                id: true,
-                username: true,
-                name: true,
-                avatar: true,
-              },
-            },
-            _count: {
-              select: {
-                votes: true,
-                contributors: true,
-                outgoingConnections: { where: { label: { not: "related" } } },
-                incomingConnections: { where: { label: { not: "related" } } },
-              },
-            },
-          },
-        }),
-        db.prompt.count({ where }),
+      const [docs, totalCount] = await Promise.all([
+        promptsCol()
+          .find(filter)
+          .sort({ [sort.field]: sort.order })
+          .limit(perPage)
+          .toArray(),
+        promptsCol().countDocuments(filter),
       ]);
 
-      return {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        skills: skillsRaw.map((p: any) => ({
-          ...p,
-          voteCount: p._count.votes,
-          contributorCount: p._count.contributors,
-          contributors: p.contributors,
-        })),
-        total: totalCount,
-      };
+      const skills = await formatPromptsForCard(docs);
+
+      return { skills, total: totalCount };
     },
     ["skills", cacheKey],
     { tags: ["prompts"] }
@@ -118,16 +72,15 @@ export default async function SkillsPage({ searchParams }: SkillsPageProps) {
   
   const perPage = 24;
 
-  // Build order by clause
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let orderBy: any = { createdAt: "desc" };
+  // Build sort for MongoDB
+  let sort: { field: string; order: 1 | -1 } = { field: "createdAt", order: -1 };
   if (params.sort === "oldest") {
-    orderBy = { createdAt: "asc" };
+    sort = { field: "createdAt", order: 1 };
   } else if (params.sort === "upvotes") {
-    orderBy = { votes: { _count: "desc" } };
+    sort = { field: "voteCount", order: -1 };
   }
 
-  const result = await getCachedSkills(orderBy, perPage, params.q);
+  const result = await getCachedSkills(sort, perPage, params.q);
   const skills = result.skills;
   const total = result.total;
 

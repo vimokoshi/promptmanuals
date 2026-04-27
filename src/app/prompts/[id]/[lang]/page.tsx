@@ -1,8 +1,10 @@
 import { Metadata } from "next";
 import { notFound } from "next/navigation";
 import Link from "next/link";
-import { db } from "@/lib/db";
+import { ObjectId } from "mongodb";
 import { auth } from "@/lib/auth";
+import { promptsCol, usersCol, categoriesCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 import { getLocale } from "next-intl/server";
 import { formatDistanceToNow } from "@/lib/date";
 import { StructuredData } from "@/components/seo/structured-data";
@@ -23,7 +25,7 @@ const LANG_NAMES: Record<SupportedLang, string> = {
   es: "Español", zh: "中文", ja: "日本語", de: "Deutsch",
   fr: "Français", pt: "Português", ko: "한국어", tr: "Türkçe",
   ar: "العربية", ru: "Русский", hi: "हिन्दी", bn: "বাংলা",
-  ta: "தமிழ்", te: "తెలుగు", mr: "मराठी", gu: "ગુજરాతી",
+  ta: "தமிழ்", te: "తెలుగు", mr: "मराठी", gu: "ગુજરાતી",
 };
 
 interface PageProps {
@@ -40,21 +42,39 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   if (!SUPPORTED_LANGS.includes(lang as SupportedLang)) return { title: "Not Found" };
 
   const id = extractPromptId(idParam);
-  const prompt = await db.prompt.findUnique({
-    where: { id, deletedAt: null },
-    select: { title: true, slug: true, translations: true, category: { select: { name: true } } },
-  });
-  if (!prompt) return { title: "Not Found" };
 
-  const translations = prompt.translations as Record<string, { title?: string; content?: string }> | null;
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(id);
+  } catch {
+    return { title: "Not Found" };
+  }
+
+  const doc = await promptsCol().findOne(
+    { _id: oid, deletedAt: null },
+    { projection: { title: 1, slug: 1, translations: 1, categoryId: 1 } }
+  );
+  if (!doc) return { title: "Not Found" };
+
+  const translations = doc.translations as Record<string, { title?: string; content?: string }> | null;
   const t = translations?.[lang];
   if (!t?.title) return { title: "Not Found" };
 
+  // Fetch category name if needed
+  let categoryName = "AI";
+  if (doc.categoryId) {
+    const cat = await categoriesCol().findOne(
+      { _id: { $in: [doc.categoryId] } } as Record<string, unknown>,
+      { projection: { name: 1 } }
+    );
+    if (cat) categoryName = cat.name;
+  }
+
+  const promptStringId = docId(doc);
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://www.promptmanuals.com";
-  const canonicalUrl = `${baseUrl}/prompts/${id}_${prompt.slug}/${lang}`;
-  const englishUrl = `${baseUrl}/prompts/${id}_${prompt.slug}`;
+  const canonicalUrl = `${baseUrl}/prompts/${promptStringId}_${doc.slug}/${lang}`;
+  const englishUrl = `${baseUrl}/prompts/${promptStringId}_${doc.slug}`;
   const langName = LANG_NAMES[lang as SupportedLang];
-  const categoryName = prompt.category?.name || "AI";
   const title = `${t.title} — ${categoryName} AI Prompt in ${langName} | Prompt Manuals`;
   const description = t.content ? `${t.content.substring(0, 160)}...` : title;
 
@@ -62,7 +82,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   if (translations) {
     for (const l of SUPPORTED_LANGS) {
       if (translations[l]?.title) {
-        langAlternates[l] = `${baseUrl}/prompts/${id}_${prompt.slug}/${l}`;
+        langAlternates[l] = `${baseUrl}/prompts/${promptStringId}_${doc.slug}/${l}`;
       }
     }
   }
@@ -83,32 +103,65 @@ export default async function TranslatedPromptPage({ params }: PageProps) {
   const id = extractPromptId(idParam);
   const [session, locale] = await Promise.all([auth(), getLocale()]);
 
-  const prompt = await db.prompt.findFirst({
-    where: { id, deletedAt: null, isPrivate: false },
-    include: {
-      author: { select: { id: true, name: true, username: true, avatar: true } },
-      category: { include: { parent: true } },
-      tags: { include: { tag: true } },
-      _count: { select: { votes: true } },
-    },
-  });
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(id);
+  } catch {
+    notFound();
+  }
 
-  if (!prompt) notFound();
+  const doc = await promptsCol().findOne({ _id: oid, deletedAt: null, isPrivate: false });
 
-  const translations = prompt.translations as Record<string, { title?: string; content?: string }> | null;
+  if (!doc) notFound();
+
+  const translations = doc.translations as Record<string, { title?: string; content?: string }> | null;
   const t = translations?.[lang];
   if (!t?.title || !t?.content) notFound();
 
-  const langName = LANG_NAMES[lang as SupportedLang];
-  const englishUrl = `/prompts/${prompt.id}_${prompt.slug}`;
-  const voteCount = prompt._count?.votes ?? 0;
+  // Fetch author and category in parallel
+  const [authorDoc, categoryDoc] = await Promise.all([
+    usersCol().findOne({ _id: { $in: [doc.authorId] } } as Record<string, unknown>),
+    doc.categoryId
+      ? categoriesCol().findOne({ _id: { $in: [doc.categoryId] } } as Record<string, unknown>)
+      : Promise.resolve(null),
+  ]);
 
-  const userVote = session?.user
-    ? await db.promptVote.findUnique({
-        where: { userId_promptId: { userId: session.user.id, promptId: id } },
-      })
+  const promptStringId = docId(doc);
+  const langName = LANG_NAMES[lang as SupportedLang];
+  const englishUrl = `/prompts/${promptStringId}_${doc.slug}`;
+  const voteCount = doc.voteCount;
+
+  // Check if user has voted
+  const hasVoted = session?.user
+    ? doc.votes.some((v) => v.userId === session.user!.id)
+    : false;
+
+  const author = authorDoc
+    ? {
+        id: docId(authorDoc),
+        name: authorDoc.name,
+        username: authorDoc.username,
+        avatar: authorDoc.avatar,
+      }
+    : {
+        id: doc.authorId,
+        name: null,
+        username: doc.authorId,
+        avatar: null,
+      };
+
+  const category = categoryDoc
+    ? { name: categoryDoc.name, slug: categoryDoc.slug }
     : null;
-  const hasVoted = !!userVote;
+
+  const tags = doc.tags.map((embTag) => ({
+    tag: {
+      id: embTag._id as unknown as string,
+      name: embTag.name,
+      slug: embTag.slug,
+      color: embTag.color,
+    },
+  }));
 
   return (
     <>
@@ -118,8 +171,8 @@ export default async function TranslatedPromptPage({ params }: PageProps) {
           breadcrumbs: [
             { name: "Home", url: "/" },
             { name: "Prompts", url: "/prompts" },
-            ...(prompt.category ? [{ name: prompt.category.name, url: `/categories/${prompt.category.slug}` }] : []),
-            { name: prompt.title, url: englishUrl },
+            ...(category ? [{ name: category.name, url: `/categories/${category.slug}` }] : []),
+            { name: doc.title, url: englishUrl },
             { name: langName, url: `${englishUrl}/${lang}` },
           ],
         }}
@@ -130,7 +183,7 @@ export default async function TranslatedPromptPage({ params }: PageProps) {
           faq: [
             {
               question: `What is the ${t.title} prompt?`,
-              answer: `${t.title} — ${prompt.category?.name ?? "AI"} prompt available in ${langName} on Prompt Manuals.`,
+              answer: `${t.title} — ${category?.name ?? "AI"} prompt available in ${langName} on Prompt Manuals.`,
             },
             {
               question: `How do I use the ${t.title} prompt?`,
@@ -156,7 +209,7 @@ export default async function TranslatedPromptPage({ params }: PageProps) {
               <div className="flex items-center gap-4 mb-2">
                 <div className="shrink-0">
                   <UpvoteButton
-                    promptId={prompt.id}
+                    promptId={promptStringId}
                     initialVoted={hasVoted}
                     initialCount={voteCount}
                     isLoggedIn={!!session?.user}
@@ -166,51 +219,51 @@ export default async function TranslatedPromptPage({ params }: PageProps) {
                 <div className="flex-1 flex items-center justify-between gap-4 min-w-0">
                   <h1 className="text-3xl font-bold">{t.title}</h1>
                   <ShareDropdown
-                    promptId={prompt.id}
+                    promptId={promptStringId}
                     title={t.title}
-                    url={`/prompts/${prompt.id}_${prompt.slug}/${lang}`}
+                    url={`/prompts/${promptStringId}_${doc.slug}/${lang}`}
                   />
                 </div>
               </div>
-              {prompt.description && (
-                <p className="text-muted-foreground">{prompt.description}</p>
+              {doc.description && (
+                <p className="text-muted-foreground">{doc.description}</p>
               )}
             </div>
 
             {/* Meta info */}
             <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground mb-6">
               <div className="flex items-center gap-2">
-                <Link href={`/@${prompt.author.username}`} title={`@${prompt.author.username}`}>
+                <Link href={`/@${author.username}`} title={`@${author.username}`}>
                   <Avatar className="h-6 w-6 border-2 border-background">
-                    <AvatarImage src={prompt.author.avatar || undefined} />
+                    <AvatarImage src={author.avatar || undefined} />
                     <AvatarFallback className="text-xs">
-                      {prompt.author.name?.charAt(0) || prompt.author.username.charAt(0)}
+                      {author.name?.charAt(0) || author.username.charAt(0)}
                     </AvatarFallback>
                   </Avatar>
                 </Link>
-                <Link href={`/@${prompt.author.username}`} className="hover:underline">
-                  @{prompt.author.username}
+                <Link href={`/@${author.username}`} className="hover:underline">
+                  @{author.username}
                 </Link>
               </div>
               <AnimatedDate
-                date={prompt.createdAt}
-                relativeText={formatDistanceToNow(prompt.createdAt, locale)}
+                date={doc.createdAt}
+                relativeText={formatDistanceToNow(doc.createdAt, locale)}
                 locale={locale}
               />
             </div>
 
             {/* Category and Tags */}
-            {(prompt.category || prompt.tags.length > 0) && (
+            {(category || tags.length > 0) && (
               <div className="flex flex-wrap items-center gap-2 mb-6">
-                {prompt.category && (
-                  <Link href={`/categories/${prompt.category.slug}`}>
-                    <Badge variant="outline">{prompt.category.name}</Badge>
+                {category && (
+                  <Link href={`/categories/${category.slug}`}>
+                    <Badge variant="outline">{category.name}</Badge>
                   </Link>
                 )}
-                {prompt.category && prompt.tags.length > 0 && (
+                {category && tags.length > 0 && (
                   <span className="text-muted-foreground">•</span>
                 )}
-                {prompt.tags.map(({ tag }) => (
+                {tags.map(({ tag }) => (
                   <Link key={tag.id} href={`/tags/${tag.slug}`}>
                     <Badge
                       variant="secondary"
@@ -226,17 +279,17 @@ export default async function TranslatedPromptPage({ params }: PageProps) {
             {/* Translated prompt content */}
             <InteractivePromptContent
               content={t.content}
-              promptId={prompt.id}
+              promptId={promptStringId}
               shareTitle={t.title}
               promptTitle={t.title}
-              promptDescription={prompt.description ?? undefined}
+              promptDescription={doc.description ?? undefined}
             />
 
             {/* Language switcher */}
             <PromptLanguageRow
               currentLocale={lang}
-              promptId={prompt.id}
-              promptSlug={prompt.slug ?? ""}
+              promptId={promptStringId}
+              promptSlug={doc.slug ?? ""}
               translations={translations}
             />
           </div>

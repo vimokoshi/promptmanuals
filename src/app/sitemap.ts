@@ -1,5 +1,5 @@
 import { MetadataRoute } from "next";
-import { db } from "@/lib/db";
+import { promptsCol, categoriesCol, tagsCol } from "@/lib/mongodb";
 import { getAllChapters } from "@/lib/book/chapters";
 
 // Revalidate sitemap every hour (3600 seconds)
@@ -56,14 +56,14 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   // Dynamic pages - skip if database is unavailable (e.g., during build)
   try {
     const [categories, prompts, tags] = await Promise.all([
-      db.category.findMany({ select: { slug: true } }),
-      db.prompt.findMany({
-        where: { isPrivate: false, deletedAt: null, isUnlisted: false },
-        select: { id: true, slug: true, updatedAt: true, translations: true },
-        orderBy: { updatedAt: "desc" },
-        take: 1000,
-      }),
-      db.tag.findMany({ select: { slug: true } }),
+      categoriesCol().find({}).project({ slug: 1 }).toArray(),
+      promptsCol()
+        .find({ isPrivate: false, deletedAt: null, isUnlisted: false })
+        .project({ _id: 1, slug: 1, updatedAt: 1, translations: 1 })
+        .sort({ updatedAt: -1 })
+        .limit(1000)
+        .toArray(),
+      tagsCol().find({}).project({ slug: 1 }).toArray(),
     ]);
 
     const categoryPages: MetadataRoute.Sitemap = categories.map((category) => ({
@@ -74,7 +74,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     }));
 
     const promptPages: MetadataRoute.Sitemap = prompts.map((prompt) => ({
-      url: `${baseUrl}/prompts/${prompt.id}_${prompt.slug}`,
+      url: `${baseUrl}/prompts/${prompt._id.toHexString()}_${prompt.slug}`,
       lastModified: prompt.updatedAt,
       changeFrequency: "weekly",
       priority: 0.6,
@@ -87,7 +87,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
       return TRANSLATED_LANGS
         .filter((lang) => translations[lang]?.title)
         .map((lang) => ({
-          url: `${baseUrl}/prompts/${prompt.id}_${prompt.slug}/${lang}`,
+          url: `${baseUrl}/prompts/${prompt._id.toHexString()}_${prompt.slug}/${lang}`,
           lastModified: prompt.updatedAt,
           changeFrequency: "monthly" as const,
           priority: 0.5,

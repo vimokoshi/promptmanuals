@@ -3,7 +3,8 @@ import { redirect } from "next/navigation";
 import { getTranslations } from "next-intl/server";
 import { ArrowRight, Bookmark, Sparkles } from "lucide-react";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { collectionsCol, promptsCol } from "@/lib/mongodb";
+import { formatPromptsForCard, docId } from "@/lib/mongodb/prompt-helpers";
 import { Button } from "@/components/ui/button";
 import { PromptList } from "@/components/prompts/prompt-list";
 
@@ -15,53 +16,31 @@ export default async function CollectionPage() {
     redirect("/login");
   }
 
-  const collectionsRaw = await db.collection.findMany({
-    where: { userId: session.user.id },
-    orderBy: { createdAt: "desc" },
-    include: {
-      prompt: {
-        include: {
-          author: {
-            select: {
-              id: true,
-              name: true,
-              username: true,
-              avatar: true,
-              verified: true,
-            },
-          },
-          category: {
-            include: {
-              parent: {
-                select: { id: true, name: true, slug: true },
-              },
-            },
-          },
-          tags: {
-            include: {
-              tag: true,
-            },
-          },
-          _count: {
-            select: {
-              votes: true,
-              contributors: true,
-              outgoingConnections: { where: { label: { not: "related" } } },
-              incomingConnections: { where: { label: { not: "related" } } },
-            },
-          },
-        },
-      },
-    },
-  });
+  // Fetch saved collection entries for the user (each row = one saved promptId)
+  const collectionDocs = await collectionsCol()
+    .find({ userId: session.user.id })
+    .sort({ createdAt: -1 })
+    .toArray();
 
-  const prompts = collectionsRaw
-    .filter((c) => c.prompt && !c.prompt.deletedAt)
-    .map((c) => ({
-      ...c.prompt,
-      voteCount: c.prompt._count?.votes ?? 0,
-      contributorCount: c.prompt._count?.contributors ?? 0,
-    }));
+  // Resolve prompt documents in saved order
+  const promptIds = collectionDocs.map((c) => c.promptId);
+  const promptDocs =
+    promptIds.length > 0
+      ? await promptsCol()
+          .find({
+            _id: { $in: promptIds } as Record<string, unknown>,
+            deletedAt: null,
+          })
+          .toArray()
+      : [];
+
+  // Preserve saved order and filter out missing/deleted prompts
+  const promptIdSet = new Set(promptDocs.map((p) => docId(p)));
+  const orderedDocs = promptIds
+    .filter((id) => promptIdSet.has(id))
+    .map((id) => promptDocs.find((p) => docId(p) === id)!);
+
+  const prompts = await formatPromptsForCard(orderedDocs);
 
   return (
     <div className="container py-6">

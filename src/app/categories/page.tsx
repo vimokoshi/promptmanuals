@@ -3,53 +3,80 @@ import { getTranslations } from "next-intl/server";
 import { unstable_cache } from "next/cache";
 import { FolderOpen, ChevronRight } from "lucide-react";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { categoriesCol, promptsCol, categorySubscriptionsCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 import { SubscribeButton } from "@/components/categories/subscribe-button";
-
-// Visible prompt filter
-const visiblePromptFilter = {
-  isPrivate: false,
-  isUnlisted: false,
-  deletedAt: null,
-};
 
 // Cached categories query with filtered prompt counts
 const getCategories = unstable_cache(
   async () => {
-    const categories = await db.category.findMany({
-      where: { parentId: null },
-      orderBy: { order: "asc" },
-      include: {
-        children: {
-          orderBy: { order: "asc" },
+    // Fetch all root categories (no parent)
+    const rootCats = await categoriesCol()
+      .find({ parentId: null })
+      .sort({ order: 1 })
+      .toArray();
+
+    // Fetch all subcategories
+    const rootIds = rootCats.map((c) => docId(c));
+    const childCats = rootIds.length > 0
+      ? await categoriesCol()
+          .find({ parentId: { $in: rootIds } })
+          .sort({ order: 1 })
+          .toArray()
+      : [];
+
+    // Collect all category IDs for prompt count aggregation
+    const allIds = [...rootIds, ...childCats.map((c) => docId(c))];
+
+    // Count visible prompts per category
+    const countAgg = await promptsCol()
+      .aggregate([
+        {
+          $match: {
+            categoryId: { $in: allIds },
+            isPrivate: false,
+            isUnlisted: false,
+            deletedAt: null,
+          },
         },
-      },
+        { $group: { _id: "$categoryId", count: { $sum: 1 } } },
+      ])
+      .toArray();
+
+    const countMap = new Map(countAgg.map((c) => [c._id as string, c.count as number]));
+
+    // Build child map
+    const childMap = new Map<string, typeof childCats>();
+    for (const child of childCats) {
+      const parentId = child.parentId as string;
+      if (!childMap.has(parentId)) childMap.set(parentId, []);
+      childMap.get(parentId)!.push(child);
+    }
+
+    // Compose result
+    return rootCats.map((category) => {
+      const catId = docId(category);
+      const children = (childMap.get(catId) ?? []).map((child) => ({
+        id: docId(child),
+        name: child.name,
+        slug: child.slug,
+        description: child.description,
+        icon: child.icon,
+        order: child.order,
+        promptCount: countMap.get(docId(child)) ?? 0,
+      }));
+
+      return {
+        id: catId,
+        name: category.name,
+        slug: category.slug,
+        description: category.description,
+        icon: category.icon,
+        order: category.order,
+        promptCount: countMap.get(catId) ?? 0,
+        children,
+      };
     });
-
-    // Get all category IDs (parents + children)
-    const allCategoryIds = categories.flatMap((c) => [c.id, ...c.children.map((child) => child.id)]);
-
-    // Count visible prompts per category in one query
-    const counts = await db.prompt.groupBy({
-      by: ["categoryId"],
-      where: {
-        categoryId: { in: allCategoryIds },
-        ...visiblePromptFilter,
-      },
-      _count: true,
-    });
-
-    const countMap = new Map(counts.map((c) => [c.categoryId, c._count]));
-
-    // Attach counts to categories
-    return categories.map((category) => ({
-      ...category,
-      promptCount: countMap.get(category.id) || 0,
-      children: category.children.map((child) => ({
-        ...child,
-        promptCount: countMap.get(child.id) || 0,
-      })),
-    }));
   },
   ["categories-page"],
   { tags: ["categories"] }
@@ -59,18 +86,18 @@ export default async function CategoriesPage() {
   const t = await getTranslations("categories");
   const session = await auth();
 
-  // Fetch root categories (no parent) with their children (cached)
+  // Fetch root categories with children and prompt counts (cached)
   const rootCategories = await getCategories();
 
   // Get user's subscriptions if logged in
-  const subscriptions = session?.user
-    ? await db.categorySubscription.findMany({
-        where: { userId: session.user.id },
-        select: { categoryId: true },
-      })
+  const subscriptionDocs = session?.user
+    ? await categorySubscriptionsCol()
+        .find({ userId: session.user.id })
+        .project({ _id: 0, categoryId: 1 })
+        .toArray()
     : [];
 
-  const subscribedIds = new Set(subscriptions.map((s) => s.categoryId));
+  const subscribedIds = new Set(subscriptionDocs.map((s) => s.categoryId as string));
 
   return (
     <div className="container py-6">

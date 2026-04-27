@@ -2,7 +2,8 @@ import { Metadata } from "next";
 import { getTranslations } from "next-intl/server";
 import { unstable_cache } from "next/cache";
 import { InfinitePromptList } from "@/components/prompts/infinite-prompt-list";
-import { db } from "@/lib/db";
+import { promptsCol, promptConnectionsCol } from "@/lib/mongodb";
+import { formatPromptsForCard } from "@/lib/mongodb/prompt-helpers";
 
 export const metadata: Metadata = {
   title: "Workflows",
@@ -11,100 +12,66 @@ export const metadata: Metadata = {
 
 // Query for workflows list (cached)
 function getCachedWorkflows(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  orderBy: any,
+  sort: { field: string; order: 1 | -1 },
   perPage: number,
   searchQuery?: string
 ) {
-  const cacheKey = JSON.stringify({ orderBy, perPage, searchQuery });
-  
+  const cacheKey = JSON.stringify({ sort, perPage, searchQuery });
+
   return unstable_cache(
     async () => {
-      const where: Record<string, unknown> = {
+      // Find prompt IDs that are workflow roots:
+      // - have at least one outgoing non-"related" connection (sourceId)
+      // - are NOT the target of any non-"related" connection (no incoming)
+      const [outgoingConnections, incomingConnections] = await Promise.all([
+        promptConnectionsCol()
+          .find({ label: { $ne: "related" } })
+          .project({ sourceId: 1, targetId: 1 })
+          .toArray(),
+        promptConnectionsCol()
+          .find({ label: { $ne: "related" } })
+          .project({ targetId: 1 })
+          .toArray(),
+      ]);
+
+      const sourceIds = new Set(outgoingConnections.map((c) => c.sourceId));
+      const targetIds = new Set(incomingConnections.map((c) => c.targetId));
+
+      // Root prompts: have outgoing connections but are not someone else's target
+      const rootIds = [...sourceIds].filter((id) => !targetIds.has(id));
+
+      if (rootIds.length === 0) {
+        return { workflows: [], total: 0 };
+      }
+
+      const baseFilter: Record<string, unknown> = {
+        _id: { $in: rootIds },
         isPrivate: false,
         isUnlisted: false,
         deletedAt: null,
-        type: { not: "SKILL" },
-        // Only include prompts with actual flow connections (not "related" connections)
-        outgoingConnections: {
-          some: {
-            label: { not: "related" },
-          },
-        },
-        incomingConnections: {
-          none: {
-            label: { not: "related" },
-          },
-        },
+        type: { $ne: "SKILL" },
       };
 
       if (searchQuery) {
-        where.OR = [
-          { title: { contains: searchQuery, mode: "insensitive" } },
-          { content: { contains: searchQuery, mode: "insensitive" } },
-          { description: { contains: searchQuery, mode: "insensitive" } },
+        baseFilter.$or = [
+          { title: { $regex: searchQuery, $options: "i" } },
+          { content: { $regex: searchQuery, $options: "i" } },
+          { description: { $regex: searchQuery, $options: "i" } },
         ];
       }
 
-      const [workflowsRaw, totalCount] = await Promise.all([
-        db.prompt.findMany({
-          where,
-          orderBy,
-          skip: 0,
-          take: perPage,
-          include: {
-            author: {
-              select: {
-                id: true,
-                name: true,
-                username: true,
-                avatar: true,
-                verified: true,
-              },
-            },
-            category: {
-              include: {
-                parent: {
-                  select: { id: true, name: true, slug: true },
-                },
-              },
-            },
-            tags: {
-              include: {
-                tag: true,
-              },
-            },
-            contributors: {
-              select: {
-                id: true,
-                username: true,
-                name: true,
-                avatar: true,
-              },
-            },
-            _count: {
-              select: {
-                votes: true,
-                contributors: true,
-                outgoingConnections: { where: { label: { not: "related" } } },
-                incomingConnections: { where: { label: { not: "related" } } },
-              },
-            },
-          },
-        }),
-        db.prompt.count({ where }),
+      const [docs, totalCount] = await Promise.all([
+        promptsCol()
+          .find(baseFilter)
+          .sort({ [sort.field]: sort.order })
+          .limit(perPage)
+          .toArray(),
+        promptsCol().countDocuments(baseFilter),
       ]);
 
-      return {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        workflows: workflowsRaw.map((p: any) => ({
-          ...p,
-          voteCount: p._count.votes,
-          contributorCount: p._count.contributors,
-          contributors: p.contributors,
-        })),
-        total: totalCount,
-      };
+      const workflows = await formatPromptsForCard(docs);
+
+      return { workflows, total: totalCount };
     },
     ["workflows", cacheKey],
     { tags: ["prompts", "connections"] }
@@ -126,16 +93,15 @@ export default async function WorkflowsPage({ searchParams }: WorkflowsPageProps
   
   const perPage = 24;
 
-  // Build order by clause
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let orderBy: any = { createdAt: "desc" };
+  // Build sort for MongoDB
+  let sort: { field: string; order: 1 | -1 } = { field: "createdAt", order: -1 };
   if (params.sort === "oldest") {
-    orderBy = { createdAt: "asc" };
+    sort = { field: "createdAt", order: 1 };
   } else if (params.sort === "upvotes") {
-    orderBy = { votes: { _count: "desc" } };
+    sort = { field: "voteCount", order: -1 };
   }
 
-  const result = await getCachedWorkflows(orderBy, perPage, params.q);
+  const result = await getCachedWorkflows(sort, perPage, params.q);
   const workflows = result.workflows;
   const total = result.total;
 

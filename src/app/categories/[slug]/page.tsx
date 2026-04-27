@@ -4,13 +4,16 @@ import Link from "next/link";
 import { getTranslations } from "next-intl/server";
 import { ArrowLeft } from "lucide-react";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { categoriesCol, promptsCol, categorySubscriptionsCol } from "@/lib/mongodb";
+import { formatPromptsForCard, docId } from "@/lib/mongodb/prompt-helpers";
 import config from "@/../prompts.config";
 import { Button } from "@/components/ui/button";
 import { PromptList } from "@/components/prompts/prompt-list";
 import { SubscribeButton } from "@/components/categories/subscribe-button";
 import { CategoryFilters } from "@/components/categories/category-filters";
 import { McpServerPopup } from "@/components/mcp/mcp-server-popup";
+import type { Filter } from "mongodb";
+import type { PromptDocument } from "@/lib/mongodb";
 
 interface CategoryPageProps {
   params: Promise<{ slug: string }>;
@@ -21,10 +24,11 @@ const PROMPTS_PER_PAGE = 30;
 
 export async function generateMetadata({ params }: CategoryPageProps): Promise<Metadata> {
   const { slug } = await params;
-  const category = await db.category.findUnique({
-    where: { slug },
-    select: { name: true, description: true },
-  });
+  const category = await categoriesCol()
+    .findOne(
+      { slug },
+      { projection: { name: 1, description: 1 } }
+    );
 
   if (!category) {
     return { title: "Category Not Found" };
@@ -44,107 +48,81 @@ export default async function CategoryPage({ params, searchParams }: CategoryPag
   const session = await auth();
   const t = await getTranslations();
 
-  const category = await db.category.findUnique({
-    where: { slug },
-    include: {
-      _count: {
-        select: { prompts: true, subscribers: true },
-      },
-    },
-  });
+  const category = await categoriesCol().findOne({ slug });
 
   if (!category) {
     notFound();
   }
 
+  const catId = docId(category);
+
+  // Get subscriber count
+  const subscriberCount = await categorySubscriptionsCol().countDocuments({ categoryId: catId });
+
   // Check if user is subscribed
   const isSubscribed = session?.user
-    ? await db.categorySubscription.findUnique({
-        where: {
-          userId_categoryId: {
-            userId: session.user.id,
-            categoryId: category.id,
-          },
-        },
-      })
-    : null;
+    ? !!(await categorySubscriptionsCol().findOne({
+        userId: session.user.id,
+        categoryId: catId,
+      }))
+    : false;
 
-  // Build where clause with optional search
-  const whereClause = {
-    categoryId: category.id,
+  // Build where filter with optional search
+  const baseFilter: Filter<PromptDocument> = {
+    categoryId: catId,
     isPrivate: false,
     isUnlisted: false,
     deletedAt: null,
-    ...(q && {
-      OR: [
-        { title: { contains: q, mode: "insensitive" as const } },
-        { content: { contains: q, mode: "insensitive" as const } },
-      ],
-    }),
   };
 
-  // Build orderBy based on sort option
-  const getOrderBy = () => {
+  if (q) {
+    (baseFilter as Record<string, unknown>).$and = [
+      {
+        $or: [
+          { title: { $regex: q, $options: "i" } },
+          { content: { $regex: q, $options: "i" } },
+        ],
+      },
+    ];
+  }
+
+  // Build sort based on sort option
+  const getSort = () => {
     switch (sortOption) {
       case "oldest":
-        return { createdAt: "asc" as const };
+        return { createdAt: 1 as const };
       case "most_upvoted":
-        return { votes: { _count: "desc" as const } };
+        return { voteCount: -1 as const };
       case "most_contributors":
-        return { contributors: { _count: "desc" as const } };
+        // no contributorCount field in Mongo — fall back to voteCount
+        return { voteCount: -1 as const };
       default:
-        return { createdAt: "desc" as const };
+        return { createdAt: -1 as const };
     }
   };
 
   // Count total prompts for pagination
-  const totalPrompts = await db.prompt.count({ where: whereClause });
+  const totalPrompts = await promptsCol().countDocuments(baseFilter as Filter<PromptDocument>);
   const totalPages = Math.ceil(totalPrompts / PROMPTS_PER_PAGE);
 
   // Fetch prompts in this category
-  const promptsRaw = await db.prompt.findMany({
-    where: whereClause,
-    orderBy: getOrderBy(),
-    skip: (currentPage - 1) * PROMPTS_PER_PAGE,
-    take: PROMPTS_PER_PAGE,
-    include: {
-      author: {
-        select: {
-          id: true,
-          name: true,
-          username: true,
-          avatar: true,
-          verified: true,
-        },
-      },
-      category: {
-        include: {
-          parent: {
-            select: { id: true, name: true, slug: true },
-          },
-        },
-      },
-      tags: {
-        include: {
-          tag: true,
-        },
-      },
-      _count: {
-        select: {
-          votes: true,
-          contributors: true,
-          outgoingConnections: { where: { label: { not: "related" } } },
-          incomingConnections: { where: { label: { not: "related" } } },
-        },
-      },
-    },
-  });
+  const promptDocs = await promptsCol()
+    .find(baseFilter as Filter<PromptDocument>)
+    .sort(getSort())
+    .skip((currentPage - 1) * PROMPTS_PER_PAGE)
+    .limit(PROMPTS_PER_PAGE)
+    .toArray();
 
-  const prompts = promptsRaw.map((p) => ({
-    ...p,
-    voteCount: p._count.votes,
-    contributorCount: p._count.contributors,
-  }));
+  const prompts = await formatPromptsForCard(promptDocs);
+
+  const categoryForComponent = {
+    id: catId,
+    name: category.name,
+    description: category.description,
+    _count: {
+      subscribers: subscriberCount,
+    },
+  };
 
   return (
     <div className="container py-6">
@@ -160,25 +138,25 @@ export default async function CategoryPage({ params, searchParams }: CategoryPag
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-xl font-semibold">{category.name}</h1>
+              <h1 className="text-xl font-semibold">{categoryForComponent.name}</h1>
               {session?.user && (
                 <SubscribeButton
-                  categoryId={category.id}
-                  categoryName={category.name}
-                  initialSubscribed={!!isSubscribed}
+                  categoryId={categoryForComponent.id}
+                  categoryName={categoryForComponent.name}
+                  initialSubscribed={isSubscribed}
                   pill
                 />
               )}
             </div>
-            {category.description && (
+            {categoryForComponent.description && (
               <p className="text-sm text-muted-foreground mt-1">
-                {category.description}
+                {categoryForComponent.description}
               </p>
             )}
             <div className="flex items-center gap-3 mt-2 text-sm text-muted-foreground">
               <span>{t("categories.promptCount", { count: totalPrompts })}</span>
               <span>•</span>
-              <span>{t("categories.subscriberCount", { count: category._count.subscribers })}</span>
+              <span>{t("categories.subscriberCount", { count: categoryForComponent._count.subscribers })}</span>
             </div>
           </div>
           <div className="hidden md:flex items-center gap-2">

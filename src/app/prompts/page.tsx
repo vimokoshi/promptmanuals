@@ -11,7 +11,8 @@ import { FilterProvider } from "@/components/prompts/filter-context";
 import { PinnedCategories } from "@/components/categories/pinned-categories";
 import { HFDataStudioDropdown } from "@/components/prompts/hf-data-studio-dropdown";
 import { McpServerPopup } from "@/components/mcp/mcp-server-popup";
-import { db } from "@/lib/db";
+import { promptsCol, categoriesCol, tagsCol } from "@/lib/mongodb";
+import { formatPromptsForCard, docId } from "@/lib/mongodb/prompt-helpers";
 import { isAISearchEnabled, semanticSearch } from "@/lib/ai/embeddings";
 import { isAIGenerationEnabled } from "@/lib/ai/generation";
 import config from "@/../prompts.config";
@@ -24,15 +25,13 @@ export const metadata: Metadata = {
 // Query for categories (cached)
 const getCategories = unstable_cache(
   async () => {
-    return db.category.findMany({
-      orderBy: [{ order: "asc" }, { name: "asc" }],
-      select: {
-        id: true,
-        name: true,
-        slug: true,
-        parentId: true,
-      },
-    });
+    const docs = await categoriesCol().find({}).sort({ order: 1, name: 1 }).toArray();
+    return docs.map((c) => ({
+      id: docId(c),
+      name: c.name,
+      slug: c.slug,
+      parentId: c.parentId,
+    }));
   },
   ["categories"],
   { tags: ["categories"] }
@@ -41,16 +40,13 @@ const getCategories = unstable_cache(
 // Query for pinned categories (cached)
 const getPinnedCategories = unstable_cache(
   async () => {
-    return db.category.findMany({
-      where: { pinned: true },
-      orderBy: [{ order: "asc" }, { name: "asc" }],
-      select: {
-        id: true,
-        name: true,
-        slug: true,
-        icon: true,
-      },
-    });
+    const docs = await categoriesCol().find({ pinned: true }).sort({ order: 1, name: 1 }).toArray();
+    return docs.map((c) => ({
+      id: docId(c),
+      name: c.name,
+      slug: c.slug,
+      icon: c.icon,
+    }));
   },
   ["pinned-categories"],
   { tags: ["categories"] }
@@ -59,9 +55,13 @@ const getPinnedCategories = unstable_cache(
 // Query for tags (cached)
 const getTags = unstable_cache(
   async () => {
-    return db.tag.findMany({
-      orderBy: { name: "asc" },
-    });
+    const docs = await tagsCol().find({}).sort({ name: 1 }).toArray();
+    return docs.map((tag) => ({
+      id: docId(tag),
+      name: tag.name,
+      slug: tag.slug,
+      color: tag.color,
+    }));
   },
   ["tags"],
   { tags: ["tags"] }
@@ -69,90 +69,28 @@ const getTags = unstable_cache(
 
 // Query for prompts list (cached)
 function getCachedPrompts(
-  where: Record<string, unknown>,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  orderBy: any,
+  filter: Record<string, unknown>,
+  sort: Record<string, unknown>,
   perPage: number
 ) {
   // Create a stable cache key from the query parameters
-  const cacheKey = JSON.stringify({ where, orderBy, perPage });
-  
+  const cacheKey = JSON.stringify({ filter, sort, perPage });
+
   return unstable_cache(
     async () => {
-      const [promptsRaw, totalCount] = await Promise.all([
-        db.prompt.findMany({
-          where,
-          orderBy,
-          skip: 0,
-          take: perPage,
-          include: {
-            author: {
-              select: {
-                id: true,
-                name: true,
-                username: true,
-                avatar: true,
-                verified: true,
-              },
-            },
-            category: {
-              include: {
-                parent: {
-                  select: { id: true, name: true, slug: true },
-                },
-              },
-            },
-            tags: {
-              include: {
-                tag: true,
-              },
-            },
-            contributors: {
-              select: {
-                id: true,
-                username: true,
-                name: true,
-                avatar: true,
-              },
-            },
-            _count: {
-              select: {
-                votes: true,
-                contributors: true,
-                outgoingConnections: { where: { label: { not: "related" } } },
-                incomingConnections: { where: { label: { not: "related" } } },
-              },
-            },
-            userExamples: {
-              take: 5,
-              orderBy: { createdAt: "desc" },
-              select: {
-                id: true,
-                mediaUrl: true,
-                user: {
-                  select: {
-                    username: true,
-                    name: true,
-                    avatar: true,
-                  },
-                },
-              },
-            },
-          },
-        }),
-        db.prompt.count({ where }),
+      const [docs, totalCount] = await Promise.all([
+        promptsCol()
+          .find(filter)
+          .sort(sort)
+          .skip(0)
+          .limit(perPage)
+          .toArray(),
+        promptsCol().countDocuments(filter),
       ]);
 
-      return {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        prompts: promptsRaw.map((p: any) => ({
-          ...p,
-          voteCount: p._count.votes,
-          contributorCount: p._count.contributors,
-          contributors: p.contributors,
-        })),
-        total: totalCount,
-      };
+      const prompts = await formatPromptsForCard(docs);
+
+      return { prompts, total: totalCount };
     },
     ["prompts", cacheKey],
     { tags: ["prompts"] }
@@ -175,7 +113,7 @@ export default async function PromptsPage({ searchParams }: PromptsPageProps) {
   const t = await getTranslations("prompts");
   const tSearch = await getTranslations("search");
   const params = await searchParams;
-  
+
   const perPage = 24;
   const aiSearchAvailable = await isAISearchEnabled();
   const aiGenerationAvailable = await isAIGenerationEnabled();
@@ -186,12 +124,11 @@ export default async function PromptsPage({ searchParams }: PromptsPageProps) {
   let total = 0;
 
   if (useAISearch && params.q) {
-    // Use AI semantic search - combine keywords into a single search query
+    // Use AI semantic search
     try {
-      // Join comma-separated keywords with spaces for a single semantic search
-      const searchQuery = params.q.split(",").map(k => k.trim()).filter(Boolean).join(" ");
+      const searchQuery = params.q.split(",").map((k) => k.trim()).filter(Boolean).join(" ");
       const aiResults = await semanticSearch(searchQuery, perPage);
-      
+
       prompts = aiResults.map((p) => ({
         ...p,
         contributorCount: 0,
@@ -201,77 +138,64 @@ export default async function PromptsPage({ searchParams }: PromptsPageProps) {
       // Fallback to regular search on error
     }
   }
-  
+
   // Regular search if AI search not used or failed
   if (!useAISearch || prompts.length === 0) {
-    // Build where clause based on filters
-    const where: Record<string, unknown> = {
+    // Build MongoDB filter
+    const filter: Record<string, unknown> = {
       isPrivate: false,
-      isUnlisted: false, // Exclude unlisted prompts
-      deletedAt: null, // Exclude soft-deleted prompts
-      // Exclude intermediate flow prompts (only show first prompts or standalone)
-      // Note: "related" connections are AI-suggested similar prompts, not flow connections
-      incomingConnections: { none: { label: { not: "related" } } },
+      isUnlisted: false,
+      deletedAt: null,
     };
-    
+
     if (params.q) {
-      // Handle comma-separated keywords
-      const keywords = params.q.split(",").map(k => k.trim()).filter(Boolean);
+      const keywords = params.q.split(",").map((k) => k.trim()).filter(Boolean);
       if (keywords.length > 1) {
-        // Multiple keywords - match any of them
-        where.OR = keywords.flatMap(keyword => [
-          { title: { contains: keyword, mode: "insensitive" } },
-          { content: { contains: keyword, mode: "insensitive" } },
-          { description: { contains: keyword, mode: "insensitive" } },
+        filter.$or = keywords.flatMap((keyword) => [
+          { title: { $regex: keyword, $options: "i" } },
+          { content: { $regex: keyword, $options: "i" } },
+          { description: { $regex: keyword, $options: "i" } },
         ]);
       } else {
-        // Single keyword
-        where.OR = [
-          { title: { contains: params.q, mode: "insensitive" } },
-          { content: { contains: params.q, mode: "insensitive" } },
-          { description: { contains: params.q, mode: "insensitive" } },
+        filter.$or = [
+          { title: { $regex: params.q, $options: "i" } },
+          { content: { $regex: params.q, $options: "i" } },
+          { description: { $regex: params.q, $options: "i" } },
         ];
       }
     }
-    
+
     if (params.type) {
-      where.type = params.type;
-    }
-    
-    if (params.category) {
-      where.categoryId = params.category;
-    }
-    
-    // Handle tag parameter (can be comma-separated for multiple tags)
-    if (params.tag) {
-      // Handle multiple tags (comma-separated)
-      const tagSlugs = params.tag.split(",").map(t => t.trim()).filter(Boolean);
-      if (tagSlugs.length > 0) {
-        where.AND = tagSlugs.map(slug => ({
-          tags: {
-            some: {
-              tag: {
-                slug,
-              },
-            },
-          },
-        }));
-      }
-    }
-    
-    // Build order by clause
-    const isUpvoteSort = params.sort === "upvotes";
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let orderBy: any = { createdAt: "desc" };
-    if (params.sort === "oldest") {
-      orderBy = { createdAt: "asc" };
-    } else if (isUpvoteSort) {
-      // Sort by vote count descending
-      orderBy = { votes: { _count: "desc" } };
+      filter.type = params.type;
     }
 
-    // Fetch initial prompts (first page) - cached
-    const result = await getCachedPrompts(where, orderBy, perPage);
+    if (params.category) {
+      // params.category is the category id string
+      filter.categoryId = params.category;
+    }
+
+    // Handle tag parameter (can be comma-separated for multiple tags)
+    if (params.tag) {
+      const tagSlugs = params.tag.split(",").map((s) => s.trim()).filter(Boolean);
+      if (tagSlugs.length > 1) {
+        // All tags must match (AND semantics)
+        filter.$and = tagSlugs.map((slug) => ({
+          "tags.slug": slug,
+        }));
+      } else if (tagSlugs.length === 1) {
+        filter["tags.slug"] = tagSlugs[0];
+      }
+    }
+
+    // Build sort
+    let sort: Record<string, unknown> = { createdAt: -1 };
+    if (params.sort === "oldest") {
+      sort = { createdAt: 1 };
+    } else if (params.sort === "upvotes") {
+      sort = { voteCount: -1 };
+    }
+
+    const result = await getCachedPrompts(filter, sort, perPage);
     prompts = result.prompts;
     total = result.total;
   }
@@ -305,13 +229,13 @@ export default async function PromptsPage({ searchParams }: PromptsPageProps) {
           </Button>
         </div>
       </div>
-      
+
       <FilterProvider>
         <Suspense fallback={null}>
           <div className="mb-4">
-            <PinnedCategories 
-              categories={pinnedCategories} 
-              currentCategoryId={params.category} 
+            <PinnedCategories
+              categories={pinnedCategories}
+              currentCategoryId={params.category}
             />
           </div>
         </Suspense>
@@ -332,7 +256,7 @@ export default async function PromptsPage({ searchParams }: PromptsPageProps) {
                 q: params.q,
                 type: params.type,
                 category: params.category,
-                categorySlug: categories.find(c => c.id === params.category)?.slug,
+                categorySlug: categories.find((c) => c.id === params.category)?.slug,
                 tag: params.tag,
                 sort: params.sort,
               }}

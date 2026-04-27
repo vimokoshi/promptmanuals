@@ -2,7 +2,8 @@ import { notFound } from "next/navigation";
 import Link from "next/link";
 import { getTranslations } from "next-intl/server";
 import { ArrowLeft, Tag } from "lucide-react";
-import { db } from "@/lib/db";
+import { tagsCol, promptsCol } from "@/lib/mongodb";
+import { formatPromptsForCard } from "@/lib/mongodb/prompt-helpers";
 import { auth } from "@/lib/auth";
 import config from "@/../prompts.config";
 import { Button } from "@/components/ui/button";
@@ -16,10 +17,7 @@ interface TagPageProps {
 
 export async function generateMetadata({ params }: TagPageProps) {
   const { slug } = await params;
-  const tag = await db.tag.findUnique({
-    where: { slug },
-    select: { name: true },
-  });
+  const tag = await tagsCol().findOne({ slug });
 
   if (!tag) return { title: "Tag Not Found" };
 
@@ -36,9 +34,7 @@ export default async function TagPage({ params, searchParams }: TagPageProps) {
   const t = await getTranslations("tags");
   const tPrompts = await getTranslations("prompts");
 
-  const tag = await db.tag.findUnique({
-    where: { slug },
-  });
+  const tag = await tagsCol().findOne({ slug });
 
   if (!tag) {
     notFound();
@@ -47,66 +43,27 @@ export default async function TagPage({ params, searchParams }: TagPageProps) {
   const page = Math.max(1, parseInt(pageParam || "1") || 1);
   const perPage = 24;
 
-  // Build where clause
-  const where = {
-    tags: {
-      some: { tagId: tag.id },
-    },
+  // Build match query — prompts with embedded tag matching slug
+  const baseMatch = {
+    "tags.slug": slug,
     isUnlisted: false,
     deletedAt: null,
-    OR: session?.user
-      ? [{ isPrivate: false }, { authorId: session.user.id }]
-      : [{ isPrivate: false }],
+    ...(session?.user
+      ? { $or: [{ isPrivate: false }, { authorId: session.user.id }] }
+      : { isPrivate: false }),
   };
 
-  // Fetch prompts with this tag
-  const [promptsRaw, total] = await Promise.all([
-    db.prompt.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      skip: (page - 1) * perPage,
-      take: perPage,
-      include: {
-        author: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-            avatar: true,
-            verified: true,
-          },
-        },
-        category: {
-          include: {
-            parent: {
-              select: { id: true, name: true, slug: true },
-            },
-          },
-        },
-        tags: {
-          include: {
-            tag: true,
-          },
-        },
-        _count: {
-          select: {
-            votes: true,
-            contributors: true,
-            outgoingConnections: { where: { label: { not: "related" } } },
-            incomingConnections: { where: { label: { not: "related" } } },
-          },
-        },
-      },
-    }),
-    db.prompt.count({ where }),
+  const [docs, total] = await Promise.all([
+    promptsCol()
+      .find(baseMatch)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * perPage)
+      .limit(perPage)
+      .toArray(),
+    promptsCol().countDocuments(baseMatch),
   ]);
 
-  const prompts = promptsRaw.map((p) => ({
-    ...p,
-    voteCount: p._count.votes,
-    contributorCount: p._count.contributors,
-  }));
-
+  const prompts = await formatPromptsForCard(docs);
   const totalPages = Math.ceil(total / perPage);
 
   return (
