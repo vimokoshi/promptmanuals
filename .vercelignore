@@ -1,2 +1,8 @@
 packages/
 app/
+prisma/
+scripts/
+CodexVersion/
+PM_Vercel_25Apr26/
+n8n-workflows/
+plans/
