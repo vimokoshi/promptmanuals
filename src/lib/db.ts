@@ -1,21 +1,9 @@
-import { PrismaClient } from "@prisma/client";
-
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined;
-};
-
-// Configure Prisma for serverless environments with connection pooling
-const prismaClientSingleton = () => {
-  return new PrismaClient({
-    log:
-      process.env.NODE_ENV === "development"
-        ? ["query", "error", "warn"]
-        : ["error"],
-    datasourceUrl: process.env.DATABASE_URL,
-  });
-};
-
-export const db = globalForPrisma.prisma ?? prismaClientSingleton();
-
-// Always reuse the same instance to prevent connection pool exhaustion
-globalForPrisma.prisma = db;
+/**
+ * Legacy re-export shim.
+ *
+ * All source files have been migrated to import directly from "@/lib/mongodb".
+ * This file satisfies any remaining "@/lib/db" imports during migration.
+ *
+ * TODO: Remove this file once all imports are updated to "@/lib/mongodb".
+ */
+export { getDb, getClient, connectMongo, closeMongo } from "@/lib/mongodb";
