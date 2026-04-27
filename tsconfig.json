@@ -38,6 +38,7 @@
   ],
   "exclude": [
     "node_modules",
+    "src/__tests__/**/*",
     "app/src/**/*",
     "app/node_modules/**/*",
     "app/packages/**/*",

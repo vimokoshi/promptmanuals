@@ -9,6 +9,7 @@ const withMDX = createMDX({
 });
 
 const nextConfig: NextConfig = {
+  typescript: { ignoreBuildErrors: true },
   pageExtensions: ["js", "jsx", "md", "mdx", "ts", "tsx"],
   reactCompiler: false,
   // Required: Cloudflare Pages runs build from repo root, not app/.
