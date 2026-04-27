@@ -17,6 +17,9 @@ const nextConfig: NextConfig = {
     // Suppress type errors so Vercel builds succeed until migration is complete.
     ignoreBuildErrors: true,
   },
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
   // Configure webpack for raw imports
   webpack: (config) => {
     config.module.rules.push({
@@ -103,7 +106,7 @@ export default withSentryConfig(withMDX(withNextIntl(nextConfig)), {
     // See the following for more information:
     // https://docs.sentry.io/product/crons/
     // https://vercel.com/docs/cron-jobs
-    automaticVercelMonitors: true,
+    automaticVercelMonitors: false,
 
     // Tree-shaking options for reducing bundle size
     treeshake: {

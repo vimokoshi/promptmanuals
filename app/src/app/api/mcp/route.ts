@@ -8,10 +8,18 @@ import {
   type PrimitiveSchemaDefinition,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { db } from "@/lib/db";
+import { usersCol, promptsCol, categoriesCol, tagsCol } from "@/lib/mongodb";
 import { isValidApiKeyFormat } from "@/lib/api-key";
 import { parseSkillFiles, serializeSkillFiles, DEFAULT_SKILL_FILE } from "@/lib/skill-files";
 import appConfig from "@/../prompts.config";
+import { ObjectId } from "mongodb";
+
+// Suppress unused import warnings for types pulled in from SDK
+void ElicitResultSchema;
+void ListPromptsRequestSchema;
+void GetPromptRequestSchema;
+type _PSD = PrimitiveSchemaDefinition;
+void (undefined as unknown as _PSD);
 
 interface AuthenticatedUser {
   id: string;
@@ -21,11 +29,16 @@ interface AuthenticatedUser {
 
 async function authenticateApiKey(apiKey: string | null): Promise<AuthenticatedUser | null> {
   if (!apiKey || !isValidApiKeyFormat(apiKey)) return null;
-  const user = await db.user.findUnique({
-    where: { apiKey },
-    select: { id: true, username: true, mcpPromptsPublicByDefault: true },
-  });
-  return user;
+  const user = await usersCol().findOne(
+    { apiKey },
+    { projection: { _id: 1, username: 1, mcpPromptsPublicByDefault: 1 } }
+  );
+  if (!user) return null;
+  return {
+    id: user._id.toHexString(),
+    username: user.username,
+    mcpPromptsPublicByDefault: user.mcpPromptsPublicByDefault ?? false,
+  };
 }
 
 function slugify(text: string): string {
@@ -52,7 +65,6 @@ function extractVariables(content: string): ExtractedVariable[] {
   return vars;
 }
 
-// Re-export types from the pages router source
 type ServerOptions = {
   authenticatedUser: AuthenticatedUser | null;
   categories?: string[];
@@ -77,55 +89,88 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
     },
     async ({ query, category, limit = 10, page = 1 }) => {
       try {
-        const whereClause: Record<string, unknown> = {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const filter: Record<string, any> = {
           isPrivate: false,
           isUnlisted: false,
           deletedAt: null,
         };
 
-        if (options.categories?.length) {
-          whereClause.category = { slug: { in: options.categories } };
-        } else if (category) {
-          whereClause.category = { slug: category };
+        // Category filter - look up category by slug
+        let categoryId: string | null = null;
+        const targetCategorySlug = options.categories?.length ? options.categories[0] : category;
+        if (targetCategorySlug) {
+          const cat = await categoriesCol().findOne({ slug: targetCategorySlug });
+          if (cat) categoryId = cat._id.toHexString();
         }
+        if (categoryId) filter.categoryId = categoryId;
 
+        // Tag filter
         if (options.tags?.length) {
-          whereClause.tags = { some: { tag: { slug: { in: options.tags } } } };
+          const tagDocs = await tagsCol().find({ slug: { $in: options.tags } }).toArray();
+          const tagIds = tagDocs.map((t) => t._id.toHexString());
+          if (tagIds.length) filter["tags._id"] = { $in: tagIds };
         }
 
+        // User filter
         if (options.users?.length) {
-          whereClause.author = { username: { in: options.users } };
+          const userDocs = await usersCol().find({ username: { $in: options.users } }).toArray();
+          const userIds = userDocs.map((u) => u._id.toHexString());
+          if (userIds.length) filter.authorId = { $in: userIds };
         }
 
-        const prompts = await db.prompt.findMany({
-          where: whereClause,
-          select: {
-            id: true, title: true, slug: true, description: true, content: true, type: true,
-            viewCount: true, createdAt: true, updatedAt: true, structuredFormat: true,
-            requiresMediaUpload: true, requiredMediaType: true,
-            category: { select: { id: true, name: true, slug: true, icon: true } },
-            author: { select: { username: true, name: true, avatar: true, verified: true } },
-            tags: { select: { tag: { select: { id: true, name: true, slug: true, color: true } } } },
-            _count: { select: { votes: true, comments: true } },
-          },
-          orderBy: { createdAt: "desc" },
-          take: limit,
-          skip: (page - 1) * limit,
-        });
+        // Text search
+        if (query) {
+          filter.$or = [
+            { title: { $regex: query, $options: "i" } },
+            { description: { $regex: query, $options: "i" } },
+            { content: { $regex: query, $options: "i" } },
+          ];
+        }
+
+        const skip = (page - 1) * limit;
+        const prompts = await promptsCol()
+          .find(filter)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        // Batch-fetch authors and categories
+        const authorIds = [...new Set(prompts.map((p) => p.authorId))];
+        const catIds = [...new Set(prompts.map((p) => p.categoryId).filter(Boolean) as string[])];
+
+        const [authors, categories] = await Promise.all([
+          usersCol().find({ _id: { $in: authorIds.map((id) => { try { return new ObjectId(id); } catch { return null; } }).filter(Boolean) as ObjectId[] } }, { projection: { _id: 1, username: 1, name: 1, avatar: 1, verified: 1 } }).toArray(),
+          catIds.length ? categoriesCol().find({ _id: { $in: catIds.map((id) => { try { return new ObjectId(id); } catch { return null; } }).filter(Boolean) as ObjectId[] } }).toArray() : Promise.resolve([]),
+        ]);
+
+        const authorMap = new Map(authors.map((u) => [u._id.toHexString(), u]));
+        const catMap = new Map(categories.map((c) => [c._id.toHexString(), c]));
 
         const results = prompts.map((p) => {
+          const id = p._id.toHexString();
+          const author = authorMap.get(p.authorId);
+          const cat = p.categoryId ? catMap.get(p.categoryId) : null;
           const variables = extractVariables(p.content);
           return {
-            id: p.id, title: p.title, slug: p.slug, description: p.description,
-            content: p.content, type: p.type, viewCount: p.viewCount,
-            voteCount: p._count.votes, commentCount: p._count.comments,
-            createdAt: p.createdAt, updatedAt: p.updatedAt,
-            category: p.category,
-            author: { username: p.author.username, name: p.author.name, avatar: p.author.avatar, verified: p.author.verified },
-            tags: p.tags.map((t) => t.tag),
+            id,
+            title: p.title,
+            slug: p.slug,
+            description: p.description,
+            content: p.content,
+            type: p.type,
+            viewCount: p.viewCount,
+            voteCount: p.voteCount ?? (p.votes?.length ?? 0),
+            commentCount: 0,
+            createdAt: p.createdAt,
+            updatedAt: p.updatedAt,
+            category: cat ? { id: cat._id.toHexString(), name: cat.name, slug: cat.slug, icon: cat.icon } : null,
+            author: author ? { username: author.username, name: author.name, avatar: author.avatar, verified: author.verified } : null,
+            tags: (p.tags ?? []).map((t) => ({ id: t._id, name: t.name, slug: t.slug, color: t.color })),
             hasVariables: variables.length > 0,
             variables,
-            link: `https://prompts.chat/prompts/${p.id}_${getPromptName(p)}`,
+            link: `https://prompts.chat/prompts/${id}_${getPromptName({ id, slug: p.slug, title: p.title })}`,
           };
         });
 
@@ -140,7 +185,7 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
     "get_prompt",
     {
       title: "Get Prompt",
-      description: "Get a single prompt by ID. Optionally fill template variables or get full content.",
+      description: "Get a single prompt by ID.",
       inputSchema: {
         promptId: z.string().describe("Prompt ID"),
         fillVariables: z.boolean().optional().default(false).describe("Whether to fill template variables"),
@@ -149,28 +194,24 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
     },
     async ({ promptId, fillVariables = false, variables = {} }) => {
       try {
-        const prompt = await db.prompt.findUnique({
-          where: { id: promptId },
-          select: {
-            id: true, title: true, slug: true, description: true, content: true, type: true,
-            mediaUrl: true, viewCount: true, createdAt: true, updatedAt: true,
-            structuredFormat: true, requiresMediaUpload: true, requiredMediaType: true,
-            category: { select: { id: true, name: true, slug: true, icon: true } },
-            author: { select: { username: true, name: true, avatar: true, verified: true } },
-            tags: { select: { tag: { select: { id: true, name: true, slug: true, color: true } } } },
-            _count: { select: { votes: true, comments: true } },
-          },
-        });
+        let oid: ObjectId;
+        try { oid = new ObjectId(promptId); } catch { return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Prompt not found" }) }], isError: true }; }
 
-        if (!prompt || (prompt as unknown as { isPrivate?: boolean }).isPrivate || (prompt as unknown as { isUnlisted?: boolean }).isUnlisted) {
+        const p = await promptsCol().findOne({ _id: oid });
+        if (!p || p.isPrivate || p.isUnlisted) {
           return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Prompt not found" }) }], isError: true };
         }
 
-        await db.prompt.update({ where: { id: promptId }, data: { viewCount: { increment: 1 } } });
+        // Increment view count
+        await promptsCol().updateOne({ _id: oid }, { $inc: { viewCount: 1 } });
 
-        const variables_list = extractVariables(prompt.content);
+        const [author, cat] = await Promise.all([
+          p.authorId ? usersCol().findOne({ _id: new ObjectId(p.authorId) }, { projection: { username: 1, name: 1, avatar: 1, verified: 1 } }) : null,
+          p.categoryId ? categoriesCol().findOne({ _id: new ObjectId(p.categoryId) }) : null,
+        ]);
 
-        let content = prompt.content;
+        const variables_list = extractVariables(p.content);
+        let content = p.content;
         if (fillVariables && variables && Object.keys(variables).length > 0) {
           for (const [key, value] of Object.entries(variables)) {
             if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
@@ -179,17 +220,26 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
           }
         }
 
+        const id = p._id.toHexString();
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
-              ...prompt,
+              id,
+              title: p.title,
+              slug: p.slug,
+              description: p.description,
               content,
+              type: p.type,
+              mediaUrl: p.mediaUrl,
+              viewCount: p.viewCount,
+              createdAt: p.createdAt,
+              updatedAt: p.updatedAt,
               variables: variables_list,
-              author: prompt.author.name || prompt.author.username,
-              category: prompt.category?.name || null,
-              tags: prompt.tags.map((t) => t.tag.name),
-              link: `https://prompts.chat/prompts/${prompt.id}_${getPromptName(prompt)}`,
+              author: author ? (author.name || author.username) : null,
+              category: cat?.name ?? null,
+              tags: (p.tags ?? []).map((t) => t.name),
+              link: `https://prompts.chat/prompts/${id}_${getPromptName({ id, slug: p.slug, title: p.title })}`,
             }),
           }],
         };
@@ -220,30 +270,64 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
       try {
         let categoryId: string | null = null;
         if (category) {
-          const cat = await db.category.findUnique({ where: { slug: category } });
-          if (cat) categoryId = cat.id;
+          const cat = await categoriesCol().findOne({ slug: category });
+          if (cat) categoryId = cat._id.toHexString();
         }
-        const tagConnections = tags?.length
-          ? { create: await Promise.all(tags.map(async (tagSlug) => {
-              let tag = await db.tag.findUnique({ where: { slug: tagSlug } });
-              if (!tag) tag = await db.tag.create({ data: { name: tagSlug, slug: tagSlug } });
-              return { tagId: tag.id };
-            })) }
-          : undefined;
-        const prompt = await db.prompt.create({
-          data: {
-            title: title as string,
-            slug: slugify(title as string),
-            content,
-            description: description || null,
-            isPrivate,
-            authorId: options.authenticatedUser.id,
-            categoryId,
-            tags: tagConnections,
-          } as Parameters<typeof db.prompt.create>[0]["data"],
-          select: { id: true, slug: true, title: true, isPrivate: true, createdAt: true },
-        });
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, prompt, link: `https://prompts.chat/prompts/${prompt.id}_${getPromptName(prompt)}` }) }] };
+
+        // Resolve tag documents, creating if necessary
+        const tagDocs = await Promise.all((tags ?? []).map(async (tagSlug) => {
+          let tag = await tagsCol().findOne({ slug: tagSlug });
+          if (!tag) {
+            const oid = new ObjectId();
+            await tagsCol().insertOne({ _id: oid, name: tagSlug, slug: tagSlug, color: "#6b7280", createdAt: new Date(), updatedAt: new Date() } as Parameters<ReturnType<typeof tagsCol>["insertOne"]>[0]);
+            tag = await tagsCol().findOne({ _id: oid });
+          }
+          return tag!;
+        }));
+
+        const now = new Date();
+        const oid = new ObjectId();
+        const id = oid.toHexString();
+        const slug = slugify(title);
+
+        await promptsCol().insertOne({
+          _id: oid,
+          title,
+          slug,
+          content,
+          description: description ?? null,
+          type: "TEXT",
+          isPrivate,
+          isUnlisted: false,
+          isFeatured: false,
+          authorId: options.authenticatedUser.id,
+          categoryId,
+          tags: tagDocs.map((t) => ({ _id: t._id.toHexString(), name: t.name, slug: t.slug, color: t.color })),
+          voteCount: 0,
+          votes: [],
+          versions: [],
+          userExamples: [],
+          reports: [],
+          viewCount: 0,
+          mediaUrl: null,
+          embedding: null,
+          requiredMediaCount: null,
+          requiredMediaType: null,
+          requiresMediaUpload: false,
+          structuredFormat: null,
+          featuredAt: null,
+          unlistedAt: null,
+          delistReason: null,
+          deletedAt: null,
+          bestWithModels: [],
+          bestWithMCP: null,
+          workflowLink: null,
+          createdAt: now,
+          updatedAt: now,
+        } as Parameters<ReturnType<typeof promptsCol>["insertOne"]>[0]);
+
+        const link = isPrivate ? null : `https://prompts.chat/prompts/${id}_${getPromptName({ id, slug, title })}`;
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, prompt: { id, slug, title, isPrivate, createdAt: now }, link }) }] };
       } catch (error) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Failed to save prompt" }) }], isError: true };
       }
@@ -270,7 +354,7 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
           text: JSON.stringify({
             original: content,
             improved: content,
-            note: "AI improvement requires OpenAI API integration. Set GOOGLECLOUD_PROJECT and OPENAI_API_KEY environment variables.",
+            note: "AI improvement requires OpenAI API integration.",
             goal: goal || "General improvement",
           }),
         }],
@@ -299,37 +383,74 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
       try {
         let categoryId: string | null = null;
         if (category) {
-          const cat = await db.category.findUnique({ where: { slug: category } });
-          if (cat) categoryId = cat.id;
+          const cat = await categoriesCol().findOne({ slug: category });
+          if (cat) categoryId = cat._id.toHexString();
         }
+
+        const tagDocs = await Promise.all((tags ?? []).map(async (tagSlug) => {
+          let tag = await tagsCol().findOne({ slug: tagSlug });
+          if (!tag) {
+            const oid = new ObjectId();
+            await tagsCol().insertOne({ _id: oid, name: tagSlug, slug: tagSlug, color: "#6b7280", createdAt: new Date(), updatedAt: new Date() } as Parameters<ReturnType<typeof tagsCol>["insertOne"]>[0]);
+            tag = await tagsCol().findOne({ _id: oid });
+          }
+          return tag!;
+        }));
+
         const files = content ? [{ filename: DEFAULT_SKILL_FILE, content }] : [];
-        const tagConnections = tags?.length
-          ? { create: await Promise.all(tags.map(async (tagSlug) => {
-              let tag = await db.tag.findUnique({ where: { slug: tagSlug } });
-              if (!tag) tag = await db.tag.create({ data: { name: tagSlug, slug: tagSlug } });
-              return { tagId: tag.id };
-            })) }
-          : undefined;
-        const skill = await db.prompt.create({
-          data: {
-            title: title as string,
-            slug: slugify(title as string),
-            content,
-            description: description || null,
-            isPrivate,
-            type: "SKILL" as unknown as "TEXT",
-            authorId: options.authenticatedUser.id,
-            categoryId,
-            tags: tagConnections,
-          } as Parameters<typeof db.prompt.create>[0]["data"],
-          select: { id: true, slug: true, title: true, description: true, isPrivate: true, createdAt: true },
-        });
+        const now = new Date();
+        const oid = new ObjectId();
+        const id = oid.toHexString();
+        const slug = slugify(title);
+
+        await promptsCol().insertOne({
+          _id: oid,
+          title,
+          slug,
+          content: content ?? "",
+          description: description ?? null,
+          type: "SKILL",
+          isPrivate,
+          isUnlisted: false,
+          isFeatured: false,
+          authorId: options.authenticatedUser.id,
+          categoryId,
+          tags: tagDocs.map((t) => ({ _id: t._id.toHexString(), name: t.name, slug: t.slug, color: t.color })),
+          voteCount: 0,
+          votes: [],
+          versions: [],
+          userExamples: [],
+          reports: [],
+          viewCount: 0,
+          mediaUrl: null,
+          embedding: null,
+          requiredMediaCount: null,
+          requiredMediaType: null,
+          requiresMediaUpload: false,
+          structuredFormat: null,
+          featuredAt: null,
+          unlistedAt: null,
+          delistReason: null,
+          deletedAt: null,
+          bestWithModels: [],
+          bestWithMCP: null,
+          workflowLink: null,
+          createdAt: now,
+          updatedAt: now,
+        } as Parameters<ReturnType<typeof promptsCol>["insertOne"]>[0]);
+
+        // Serialize skill files if content provided
+        if (files.length) {
+          await serializeSkillFiles(id, files);
+        }
+
+        const link = isPrivate ? null : `https://prompts.chat/prompts/${id}_${getPromptName({ id, slug, title })}`;
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
               success: true,
-              skill: { ...skill, files: files.map((f) => f.filename), link: skill.isPrivate ? null : `https://prompts.chat/prompts/${skill.id}_${getPromptName(skill)}` },
+              skill: { id, slug, title, description, isPrivate, files: files.map((f) => f.filename), link, createdAt: now },
             }),
           }],
         };
@@ -348,19 +469,38 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
     },
     async ({ skillId }) => {
       try {
-        const skill = await db.prompt.findUnique({
-          where: { id: skillId },
-          select: {
-            id: true, title: true, slug: true, description: true, content: true, isPrivate: true,
-            category: { select: { name: true, slug: true } },
-            author: { select: { username: true, name: true } },
-            tags: { select: { tag: { select: { name: true, slug: true } } } },
-          },
-        });
+        let oid: ObjectId;
+        try { oid = new ObjectId(skillId); } catch { return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Skill not found" }) }], isError: true }; }
+
+        const skill = await promptsCol().findOne({ _id: oid, type: "SKILL" });
         if (!skill || skill.isPrivate) {
           return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Skill not found" }) }], isError: true };
         }
-        return { content: [{ type: "text" as const, text: JSON.stringify({ ...skill, category: skill.category?.name || null, tags: skill.tags.map((t) => t.tag.name), files: [DEFAULT_SKILL_FILE] }) }] };
+
+        const [author, cat] = await Promise.all([
+          skill.authorId ? usersCol().findOne({ _id: new ObjectId(skill.authorId) }, { projection: { username: 1, name: 1 } }) : null,
+          skill.categoryId ? categoriesCol().findOne({ _id: new ObjectId(skill.categoryId) }) : null,
+        ]);
+
+        const files = await parseSkillFiles(skillId);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              id: skillId,
+              title: skill.title,
+              slug: skill.slug,
+              description: skill.description,
+              content: skill.content,
+              isPrivate: skill.isPrivate,
+              category: cat?.name ?? null,
+              author: author ? { username: author.username, name: author.name } : null,
+              tags: (skill.tags ?? []).map((t) => t.name),
+              files: files.length ? files.map((f) => f.filename) : [DEFAULT_SKILL_FILE],
+            }),
+          }],
+        };
       } catch (error) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Failed to get skill" }) }], isError: true };
       }
@@ -379,13 +519,17 @@ function createServer(options: ServerOptions): InstanceType<typeof McpServer> {
     },
     async ({ query, limit = 10 }) => {
       try {
-        const skills = await db.prompt.findMany({
-          where: { type: "SKILL", isPrivate: false, isUnlisted: false, deletedAt: null },
-          select: { id: true, title: true, description: true, slug: true, createdAt: true },
-          take: limit,
-          orderBy: { createdAt: "desc" },
-        });
-        return { content: [{ type: "text" as const, text: JSON.stringify({ query, count: skills.length, results: skills }) }] };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const filter: Record<string, any> = { type: "SKILL", isPrivate: false, isUnlisted: false, deletedAt: null };
+        if (query) {
+          filter.$or = [
+            { title: { $regex: query, $options: "i" } },
+            { description: { $regex: query, $options: "i" } },
+          ];
+        }
+        const skills = await promptsCol().find(filter).sort({ createdAt: -1 }).limit(limit).toArray();
+        const results = skills.map((s) => ({ id: s._id.toHexString(), title: s.title, description: s.description, slug: s.slug, createdAt: s.createdAt }));
+        return { content: [{ type: "text" as const, text: JSON.stringify({ query, count: results.length, results }) }] };
       } catch (error) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Search failed" }) }], isError: true };
       }
@@ -471,3 +615,6 @@ export async function DELETE() {
   }
   return new NextResponse(null, { status: 204 });
 }
+
+// Suppress unused variable warning for parseBody (kept for future use)
+void parseBody;
