@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { Prisma } from "@prisma/client";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { usersCol, promptsCol } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import { findAndSaveRelatedPrompts } from "@/lib/ai/embeddings";
 import { getConfig } from "@/lib/config";
 
@@ -14,10 +14,10 @@ export async function POST() {
     }
 
     // Check if user is admin
-    const user = await db.user.findUnique({
-      where: { id: session.user.id },
-      select: { role: true },
-    });
+    const user = await usersCol().findOne(
+      { _id: new ObjectId(session.user.id) },
+      { projection: { role: 1 } }
+    );
 
     if (user?.role !== "ADMIN") {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
@@ -33,16 +33,11 @@ export async function POST() {
     }
 
     // Get all public prompts with embeddings
-    const prompts = await db.prompt.findMany({
-      where: {
-        isPrivate: false,
-        isUnlisted: false,
-        deletedAt: null,
-        embedding: { not: Prisma.DbNull },
-      },
-      select: { id: true },
-      orderBy: { createdAt: "desc" },
-    });
+    const prompts = await promptsCol()
+      .find({ isPrivate: false, isUnlisted: false, deletedAt: null, embedding: { $ne: null } })
+      .sort({ createdAt: -1 })
+      .project({ _id: 1 })
+      .toArray();
 
     if (prompts.length === 0) {
       return NextResponse.json({ error: "No prompts to process" }, { status: 400 });
@@ -58,11 +53,12 @@ export async function POST() {
         for (let i = 0; i < prompts.length; i++) {
           const prompt = prompts[i];
 
+          const promptId = prompt._id.toHexString();
           try {
-            await findAndSaveRelatedPrompts(prompt.id);
+            await findAndSaveRelatedPrompts(promptId);
             success++;
           } catch (error) {
-            console.error(`Failed to generate related prompts for ${prompt.id}:`, error);
+            console.error(`Failed to generate related prompts for ${promptId}:`, error);
             failed++;
           }
 

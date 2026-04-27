@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
+import { ObjectId } from "mongodb";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
 
 const customLinkSchema = z.object({
   type: z.enum(["website", "github", "twitter", "linkedin", "instagram", "youtube", "twitch", "discord", "mastodon", "bluesky", "sponsor"]),
@@ -46,12 +46,12 @@ export async function PATCH(request: NextRequest) {
 
     // Check if username is taken by another user
     if (username !== session.user.username) {
-      const existingUser = await db.user.findUnique({
-        where: { username },
-        select: { id: true },
-      });
+      const existingUser = await usersCol().findOne(
+        { username },
+        { projection: { _id: 1 } }
+      );
 
-      if (existingUser && existingUser.id !== session.user.id) {
+      if (existingUser && existingUser._id.toHexString() !== session.user.id) {
         return NextResponse.json(
           { error: "username_taken", message: "This username is already taken" },
           { status: 400 }
@@ -60,27 +60,32 @@ export async function PATCH(request: NextRequest) {
     }
 
     // Update user
-    const user = await db.user.update({
-      where: { id: session.user.id },
-      data: {
-        name,
-        username,
-        avatar: avatar || null,
-        bio: bio || null,
-        customLinks: customLinks && customLinks.length > 0 ? customLinks : Prisma.DbNull,
+    const updateResult = await usersCol().findOneAndUpdate(
+      { _id: new ObjectId(session.user.id) },
+      {
+        $set: {
+          name,
+          username,
+          avatar: avatar || null,
+          bio: bio || null,
+          customLinks: (customLinks && customLinks.length > 0) ? customLinks : null,
+          updatedAt: new Date(),
+        },
       },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        email: true,
-        avatar: true,
-        bio: true,
-        customLinks: true,
-      },
-    });
+      {
+        returnDocument: "after",
+        projection: { _id: 1, name: 1, username: 1, email: 1, avatar: 1, bio: 1, customLinks: 1 },
+      }
+    );
 
-    return NextResponse.json(user);
+    if (!updateResult) {
+      return NextResponse.json(
+        { error: "not_found", message: "User not found" },
+        { status: 404 }
+      );
+    }
+
+    return NextResponse.json({ ...updateResult, id: updateResult._id.toHexString() });
   } catch (error) {
     console.error("Update profile error:", error);
     return NextResponse.json(
@@ -100,18 +105,10 @@ export async function GET() {
       );
     }
 
-    const user = await db.user.findUnique({
-      where: { id: session.user.id },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        email: true,
-        avatar: true,
-        role: true,
-        createdAt: true,
-      },
-    });
+    const user = await usersCol().findOne(
+      { _id: new ObjectId(session.user.id) },
+      { projection: { _id: 1, name: 1, username: 1, email: 1, avatar: 1, role: 1, createdAt: 1 } }
+    );
 
     if (!user) {
       return NextResponse.json(
@@ -120,7 +117,7 @@ export async function GET() {
       );
     }
 
-    return NextResponse.json(user);
+    return NextResponse.json({ ...user, id: user._id.toHexString() });
   } catch (error) {
     console.error("Get profile error:", error);
     return NextResponse.json(

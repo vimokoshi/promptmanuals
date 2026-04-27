@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
-import { Prisma } from "@prisma/client";
+import { webhookConfigsCol } from "@/lib/mongodb";
+import type { WebhookEvent } from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
 import { isPrivateUrl } from "@/lib/webhook";
 
 const VALID_METHODS = ["GET", "POST", "PUT", "PATCH"];
@@ -13,7 +14,7 @@ interface UpdateWebhookData {
   method?: string;
   headers?: Record<string, string> | null;
   payload?: string;
-  events?: string[];
+  events?: WebhookEvent[];
   isEnabled?: boolean;
 }
 
@@ -73,7 +74,7 @@ function validateUpdateWebhook(body: unknown): { success: true; data: UpdateWebh
     if (!Array.isArray(data.events) || !data.events.every(e => typeof e === "string" && VALID_EVENTS.includes(e))) {
       return { success: false, error: `Events must be an array of: ${VALID_EVENTS.join(", ")}` };
     }
-    result.events = data.events;
+    result.events = data.events as WebhookEvent[];
   }
 
   if (data.isEnabled !== undefined) {
@@ -98,15 +99,21 @@ export async function GET(
     }
 
     const { id } = await params;
-    const webhook = await db.webhookConfig.findUnique({
-      where: { id },
-    });
+
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "not_found" }, { status: 404 });
+    }
+
+    const webhook = await webhookConfigsCol().findOne({ _id: objectId });
 
     if (!webhook) {
       return NextResponse.json({ error: "not_found" }, { status: 404 });
     }
 
-    return NextResponse.json(webhook);
+    return NextResponse.json({ ...webhook, id: webhook._id.toHexString() });
   } catch (error) {
     console.error("Get webhook error:", error);
     return NextResponse.json({ error: "server_error" }, { status: 500 });
@@ -125,6 +132,14 @@ export async function PATCH(
     }
 
     const { id } = await params;
+
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "not_found" }, { status: 404 });
+    }
+
     const body = await request.json();
     const validation = validateUpdateWebhook(body);
 
@@ -135,19 +150,17 @@ export async function PATCH(
       );
     }
 
-    // Build update data with proper Prisma types
-    const updateData: Record<string, unknown> = { ...validation.data };
-    
-    if (validation.data.headers === null) {
-      updateData.headers = Prisma.JsonNull;
+    const result = await webhookConfigsCol().findOneAndUpdate(
+      { _id: objectId },
+      { $set: { ...validation.data, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    if (!result) {
+      return NextResponse.json({ error: "not_found" }, { status: 404 });
     }
 
-    const webhook = await db.webhookConfig.update({
-      where: { id },
-      data: updateData as Prisma.WebhookConfigUpdateInput,
-    });
-
-    return NextResponse.json(webhook);
+    return NextResponse.json({ ...result, id: result._id.toHexString() });
   } catch (error) {
     console.error("Update webhook error:", error);
     return NextResponse.json({ error: "server_error" }, { status: 500 });
@@ -166,9 +179,19 @@ export async function DELETE(
     }
 
     const { id } = await params;
-    await db.webhookConfig.delete({
-      where: { id },
-    });
+
+    let objectId: ObjectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch {
+      return NextResponse.json({ error: "not_found" }, { status: 404 });
+    }
+
+    const deleteResult = await webhookConfigsCol().deleteOne({ _id: objectId });
+
+    if (deleteResult.deletedCount === 0) {
+      return NextResponse.json({ error: "not_found" }, { status: 404 });
+    }
 
     return NextResponse.json({ success: true });
   } catch (error) {

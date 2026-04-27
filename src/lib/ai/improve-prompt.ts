@@ -1,6 +1,5 @@
 import OpenAI from "openai";
-import { Prisma } from "@prisma/client";
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
 import { generateEmbedding, isAISearchEnabled } from "@/lib/ai/embeddings";
 import { loadPrompt, getSystemPrompt, interpolatePrompt } from "@/lib/ai/load-prompt";
 import { TYPE_DEFINITIONS } from "@/data/type-definitions";
@@ -79,22 +78,18 @@ async function findSimilarPrompts(
     const queryEmbedding = await generateEmbedding(query);
     const dbType = mapOutputTypeToDbType(outputType);
 
-    const prompts = await db.prompt.findMany({
-      where: {
-        isPrivate: false,
-        deletedAt: null,
-        embedding: { not: Prisma.DbNull },
-        ...(dbType ? { type: dbType } : {}),
-      },
-      select: {
-        id: true,
-        slug: true,
-        title: true,
-        content: true,
-        embedding: true,
-      },
-      take: 100,
-    });
+    const filter: Record<string, unknown> = {
+      isPrivate: false,
+      deletedAt: null,
+      embedding: { $ne: null },
+    };
+    if (dbType) filter.type = dbType;
+
+    const prompts = await promptsCol()
+      .find(filter)
+      .project({ slug: 1, title: 1, content: 1, embedding: 1 })
+      .limit(100)
+      .toArray();
 
     console.log(`[improve-prompt] Found ${prompts.length} prompts with embeddings`);
 
@@ -105,10 +100,10 @@ async function findSimilarPrompts(
         const embedding = prompt.embedding as number[];
         const similarity = cosineSimilarity(queryEmbedding, embedding);
         return {
-          id: prompt.id,
-          slug: prompt.slug,
-          title: prompt.title,
-          content: prompt.content,
+          id: prompt._id.toHexString(),
+          slug: prompt.slug as string | null,
+          title: prompt.title as string,
+          content: prompt.content as string,
           similarity,
         };
       })

@@ -2,8 +2,7 @@ import { Metadata } from "next";
 import { redirect } from "next/navigation";
 import { getTranslations } from "next-intl/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
-import { Prisma } from "@prisma/client";
+import { usersCol, promptsCol, categoriesCol, tagsCol, webhookConfigsCol } from "@/lib/mongodb";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Users, FolderTree, Tags, FileText } from "lucide-react";
 import { AdminTabs } from "@/components/admin/admin-tabs";
@@ -31,104 +30,106 @@ export default async function AdminPage() {
 
   // Fetch stats and AI search status
   const [userCount, promptCount, categoryCount, tagCount, aiSearchEnabled] = await Promise.all([
-    db.user.count(),
-    db.prompt.count(),
-    db.category.count(),
-    db.tag.count(),
+    usersCol().countDocuments(),
+    promptsCol().countDocuments(),
+    categoriesCol().countDocuments(),
+    tagsCol().countDocuments(),
     isAISearchEnabled(),
   ]);
-  
+
   // Count prompts without embeddings and total public prompts
   let promptsWithoutEmbeddings = 0;
   let totalPublicPrompts = 0;
   if (aiSearchEnabled) {
     [promptsWithoutEmbeddings, totalPublicPrompts] = await Promise.all([
-      db.prompt.count({
-        where: {
-          isPrivate: false,
-          deletedAt: null,
-          embedding: { equals: Prisma.DbNull },
-        },
-      }),
-      db.prompt.count({
-        where: {
-          isPrivate: false,
-          deletedAt: null,
-        },
-      }),
+      promptsCol().countDocuments({ isPrivate: false, deletedAt: null, embedding: null }),
+      promptsCol().countDocuments({ isPrivate: false, deletedAt: null }),
     ]);
   }
 
   // Count prompts without slugs
   const [promptsWithoutSlugs, totalPrompts] = await Promise.all([
-    db.prompt.count({
-      where: {
-        slug: null,
-        deletedAt: null,
-      },
-    }),
-    db.prompt.count({
-      where: {
-        deletedAt: null,
-      },
-    }),
+    promptsCol().countDocuments({ slug: null, deletedAt: null }),
+    promptsCol().countDocuments({ deletedAt: null }),
   ]);
 
-  // Fetch data for tables (users are fetched client-side with pagination)
-  const [categories, tags, webhooks, reports] = await Promise.all([
-    db.category.findMany({
-      orderBy: [{ parentId: "asc" }, { order: "asc" }],
-      include: {
-        _count: {
-          select: {
-            prompts: true,
-            children: true,
-          },
-        },
-        parent: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-      },
-    }),
-    db.tag.findMany({
-      orderBy: { name: "asc" },
-      include: {
-        _count: {
-          select: {
-            prompts: true,
-          },
-        },
-      },
-    }),
-    db.webhookConfig.findMany({
-      orderBy: { createdAt: "desc" },
-    }),
-    db.promptReport.findMany({
-      orderBy: { createdAt: "desc" },
-      include: {
+  // Fetch categories with prompt counts and children counts
+  const allCategories = await categoriesCol().find({}).sort({ parentId: 1, order: 1 }).toArray();
+  const allCategoryIds = allCategories.map(c => c._id.toHexString());
+
+  const promptCountsAgg = await promptsCol().aggregate([
+    { $match: { categoryId: { $in: allCategoryIds } } },
+    { $group: { _id: "$categoryId", count: { $sum: 1 } } },
+  ]).toArray();
+  const promptCountMap: Record<string, number> = Object.fromEntries(
+    promptCountsAgg.map(p => [p._id, p.count])
+  );
+
+  const childrenCountMap: Record<string, number> = {};
+  allCategories.forEach(c => {
+    if (c.parentId) {
+      childrenCountMap[c.parentId] = (childrenCountMap[c.parentId] || 0) + 1;
+    }
+  });
+
+  const categories = allCategories.map(c => {
+    const id = c._id.toHexString();
+    const parent = c.parentId
+      ? allCategories.find(p => p._id.toHexString() === c.parentId) ?? null
+      : null;
+    return {
+      ...c,
+      id,
+      _count: { prompts: promptCountMap[id] || 0, children: childrenCountMap[id] || 0 },
+      parent: parent ? { id: parent._id.toHexString(), name: parent.name } : null,
+    };
+  });
+
+  // Fetch tags with prompt counts (tags embedded in prompt.tags[])
+  const allTags = await tagsCol().find({}).sort({ name: 1 }).toArray();
+  const tagIds = allTags.map(t => t._id.toHexString());
+
+  const tagPromptCountsAgg = await promptsCol().aggregate([
+    { $unwind: "$tags" },
+    { $match: { "tags._id": { $in: tagIds } } },
+    { $group: { _id: "$tags._id", count: { $sum: 1 } } },
+  ]).toArray();
+  const tagCountMap: Record<string, number> = Object.fromEntries(
+    tagPromptCountsAgg.map(t => [t._id, t.count])
+  );
+
+  const tags = allTags.map(t => ({
+    ...t,
+    id: t._id.toHexString(),
+    _count: { prompts: tagCountMap[t._id.toHexString()] || 0 },
+  }));
+
+  // Fetch webhooks
+  const webhookDocs = await webhookConfigsCol().find({}).sort({ createdAt: -1 }).toArray();
+  const webhooks = webhookDocs.map(w => ({ ...w, id: w._id.toHexString() }));
+
+  // Fetch reports (embedded in prompts)
+  const promptsWithReports = await promptsCol().find(
+    { reports: { $exists: true, $not: { $size: 0 } } },
+    { projection: { _id: 1, slug: 1, title: 1, isUnlisted: 1, deletedAt: 1, reports: 1, authorId: 1 } }
+  ).sort({ "reports.createdAt": -1 }).toArray();
+
+  const reports = promptsWithReports
+    .flatMap(p =>
+      (p.reports ?? []).map(r => ({
+        ...r,
+        id: r._id,
         prompt: {
-          select: {
-            id: true,
-            slug: true,
-            title: true,
-            isUnlisted: true,
-            deletedAt: true,
-          },
+          id: p._id.toHexString(),
+          slug: p.slug,
+          title: p.title,
+          isUnlisted: p.isUnlisted,
+          deletedAt: p.deletedAt,
         },
-        reporter: {
-          select: {
-            id: true,
-            username: true,
-            name: true,
-            avatar: true,
-          },
-        },
-      },
-    }),
-  ]);
+        reporter: { id: r.reporterId, username: "", name: null, avatar: null },
+      }))
+    )
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
   return (
     <div className="container py-6">
@@ -194,8 +195,8 @@ export default async function AdminPage() {
           tags: <TagsTable tags={tags} />,
           webhooks: <WebhooksTable webhooks={webhooks} />,
           prompts: (
-            <PromptsManagement 
-              aiSearchEnabled={aiSearchEnabled} 
+            <PromptsManagement
+              aiSearchEnabled={aiSearchEnabled}
               promptsWithoutEmbeddings={promptsWithoutEmbeddings}
               totalPublicPrompts={totalPublicPrompts}
               promptsWithoutSlugs={promptsWithoutSlugs}

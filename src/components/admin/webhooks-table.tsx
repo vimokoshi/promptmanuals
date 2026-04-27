@@ -16,14 +16,12 @@ import { Plus, MoreHorizontal, Pencil, Trash2, Slack, X, Play } from "lucide-rea
 import { SLACK_PRESET_PAYLOAD, WEBHOOK_PLACEHOLDERS } from "@/lib/webhook";
 import { CodeEditor } from "@/components/ui/code-editor";
 
-import type { JsonValue } from "@prisma/client/runtime/library";
-
 interface WebhookConfig {
   id: string;
   name: string;
   url: string;
   method: string;
-  headers: JsonValue;
+  headers: Record<string, string> | null;
   payload: string;
   events: string[];
   isEnabled: boolean;
@@ -157,7 +155,7 @@ export function WebhooksTable({ webhooks: initialWebhooks }: WebhooksTableProps)
     return Object.fromEntries(filtered.map((h) => [h.key, h.value]));
   };
 
-  const objectToHeaders = (obj: JsonValue): HeaderEntry[] => {
+  const objectToHeaders = (obj: Record<string, string> | null): HeaderEntry[] => {
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return [];
     return Object.entries(obj).map(([key, value]) => ({ key, value: String(value) }));
   };

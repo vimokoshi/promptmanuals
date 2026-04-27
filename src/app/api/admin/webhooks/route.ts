@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
-import { Prisma } from "@prisma/client";
+import { webhookConfigsCol } from "@/lib/mongodb";
+import type { WebhookConfigDocument, WebhookEvent } from "@/lib/mongodb";
 import { isPrivateUrl } from "@/lib/webhook";
 
 const VALID_METHODS = ["GET", "POST", "PUT", "PATCH"] as const;
@@ -21,47 +21,47 @@ function validateWebhook(body: unknown): { success: true; data: WebhookInput } |
   if (!body || typeof body !== "object") {
     return { success: false, error: "Invalid request body" };
   }
-  
+
   const data = body as Record<string, unknown>;
-  
+
   if (!data.name || typeof data.name !== "string" || data.name.length < 1 || data.name.length > 100) {
     return { success: false, error: "Name is required (1-100 characters)" };
   }
-  
+
   if (!data.url || typeof data.url !== "string") {
     return { success: false, error: "URL is required" };
   }
-  
+
   try {
     new URL(data.url);
   } catch {
     return { success: false, error: "Invalid URL" };
   }
-  
+
   // A10: Block private/internal URLs to prevent SSRF
   if (isPrivateUrl(data.url)) {
     return { success: false, error: "Webhook URL cannot target private/internal networks" };
   }
-  
+
   const method = (data.method as string) || "POST";
   if (!VALID_METHODS.includes(method as typeof VALID_METHODS[number])) {
     return { success: false, error: "Invalid method" };
   }
-  
+
   if (!data.payload || typeof data.payload !== "string" || data.payload.length < 1) {
     return { success: false, error: "Payload is required" };
   }
-  
+
   if (!Array.isArray(data.events) || data.events.length === 0) {
     return { success: false, error: "At least one event is required" };
   }
-  
+
   for (const event of data.events) {
     if (!VALID_EVENTS.includes(event as typeof VALID_EVENTS[number])) {
       return { success: false, error: `Invalid event: ${event}` };
     }
   }
-  
+
   return {
     success: true,
     data: {
@@ -84,11 +84,9 @@ export async function GET() {
       return NextResponse.json({ error: "unauthorized" }, { status: 401 });
     }
 
-    const webhooks = await db.webhookConfig.findMany({
-      orderBy: { createdAt: "desc" },
-    });
+    const webhooks = await webhookConfigsCol().find({}).sort({ createdAt: -1 }).toArray();
 
-    return NextResponse.json(webhooks);
+    return NextResponse.json(webhooks.map(w => ({ ...w, id: w._id.toHexString() })));
   } catch (error) {
     console.error("Get webhooks error:", error);
     return NextResponse.json({ error: "server_error" }, { status: 500 });
@@ -113,21 +111,21 @@ export async function POST(request: Request) {
       );
     }
 
-    const createData: Record<string, unknown> = {
+    const now = new Date();
+    const result = await webhookConfigsCol().insertOne({
       name: parsed.data.name,
       url: parsed.data.url,
       method: parsed.data.method || "POST",
-      headers: parsed.data.headers || Prisma.JsonNull,
+      headers: parsed.data.headers || null,
       payload: parsed.data.payload,
-      events: parsed.data.events,
+      events: parsed.data.events as WebhookEvent[],
       isEnabled: parsed.data.isEnabled ?? true,
-    };
+      createdAt: now,
+      updatedAt: now,
+    } as WebhookConfigDocument);
 
-    const webhook = await db.webhookConfig.create({
-      data: createData as Prisma.WebhookConfigCreateInput,
-    });
-
-    return NextResponse.json(webhook);
+    const webhook = await webhookConfigsCol().findOne({ _id: result.insertedId });
+    return NextResponse.json({ ...webhook, id: webhook!._id.toHexString() });
   } catch (error) {
     console.error("Create webhook error:", error);
     return NextResponse.json({ error: "server_error" }, { status: 500 });
