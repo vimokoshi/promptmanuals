@@ -1,4 +1,4 @@
-import { db } from "@/lib/db";
+import { promptsCol } from "@/lib/mongodb";
 import { semanticSearch, isAISearchEnabled } from "@/lib/ai/embeddings";
 
 export interface PromptBuilderState {
@@ -261,36 +261,23 @@ export async function executeToolCall(
         const useSemanticSearch = await isAISearchEnabled();
         
         // Full-text search
-        const textSearchPromise = db.prompt.findMany({
-          where: {
-            isPrivate: false,
-            deletedAt: null,
-            ...(promptType && { type: promptType as "TEXT" | "IMAGE" | "VIDEO" | "AUDIO" | "STRUCTURED" }),
-            ...(structuredFormat && { structuredFormat: structuredFormat as "JSON" | "YAML" }),
-            OR: [
-              { title: { contains: query, mode: "insensitive" } },
-              { description: { contains: query, mode: "insensitive" } },
-              { content: { contains: query, mode: "insensitive" } }
-            ]
-          },
-          select: {
-            id: true,
-            title: true,
-            description: true,
-            content: true,
-            type: true,
-            structuredFormat: true,
-            tags: {
-              select: {
-                tag: {
-                  select: { name: true, color: true }
-                }
-              }
-            }
-          },
-          take: limit,
-          orderBy: { createdAt: "desc" }
-        });
+        const textFilter: Record<string, unknown> = {
+          isPrivate: false,
+          deletedAt: null,
+          $or: [
+            { title: { $regex: query, $options: "i" } },
+            { description: { $regex: query, $options: "i" } },
+            { content: { $regex: query, $options: "i" } },
+          ],
+        };
+        if (promptType) textFilter.type = promptType;
+        if (structuredFormat) textFilter.structuredFormat = structuredFormat;
+
+        const textSearchPromise = promptsCol()
+          .find(textFilter, { projection: { title: 1, description: 1, content: 1, type: 1, structuredFormat: 1, tags: 1 } })
+          .sort({ createdAt: -1 })
+          .limit(limit)
+          .toArray();
 
         // Semantic search (if enabled)
         const semanticSearchPromise = useSemanticSearch 
@@ -338,17 +325,18 @@ export async function executeToolCall(
 
         // Add text search results
         for (const p of textResults) {
-          if (seenIds.has(p.id)) continue;
-          
-          seenIds.add(p.id);
+          const pid = p._id as unknown as string;
+          if (seenIds.has(pid)) continue;
+
+          seenIds.add(pid);
           combinedResults.push({
-            id: p.id,
+            id: pid,
             title: p.title,
-            description: p.description,
+            description: p.description ?? null,
             contentPreview: p.content.substring(0, 200) + (p.content.length > 200 ? "..." : ""),
             type: p.type,
-            structuredFormat: p.structuredFormat,
-            tags: p.tags.map((t: { tag: { name: string } }) => t.tag.name),
+            structuredFormat: p.structuredFormat ?? null,
+            tags: p.tags.map((t: { name: string }) => t.name),
             source: "text"
           });
         }
@@ -358,38 +346,23 @@ export async function executeToolCall(
 
         // If no results found, get random prompts to learn the style
         if (finalResults.length === 0) {
-          const randomPrompts = await db.prompt.findMany({
-            where: {
-              isPrivate: false,
-              deletedAt: null,
-            },
-            select: {
-              id: true,
-              title: true,
-              description: true,
-              content: true,
-              type: true,
-              structuredFormat: true,
-              tags: {
-                select: {
-                  tag: {
-                    select: { name: true, color: true }
-                  }
-                }
-              }
-            },
-            take: limit,
-            orderBy: { createdAt: "desc" }
-          });
+          const randomPrompts = await promptsCol()
+            .find(
+              { isPrivate: false, deletedAt: null } as Record<string, unknown>,
+              { projection: { title: 1, description: 1, content: 1, type: 1, structuredFormat: 1, tags: 1 } }
+            )
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
 
           finalResults = randomPrompts.map(p => ({
-            id: p.id,
+            id: p._id as unknown as string,
             title: p.title,
-            description: p.description,
+            description: p.description ?? null,
             contentPreview: p.content.substring(0, 200) + (p.content.length > 200 ? "..." : ""),
             type: p.type,
-            structuredFormat: p.structuredFormat,
-            tags: p.tags.map((t: { tag: { name: string } }) => t.tag.name),
+            structuredFormat: p.structuredFormat ?? null,
+            tags: p.tags.map((t: { name: string }) => t.name),
             source: "random" as const
           }));
         }

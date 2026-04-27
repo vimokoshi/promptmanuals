@@ -8,7 +8,8 @@ import { Clock, Edit, History, GitPullRequest, Check, X, Users, ImageIcon, Video
 import { AnimatedDate } from "@/components/ui/animated-date";
 import { ShareDropdown } from "@/components/prompts/share-dropdown";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { promptsCol, usersCol, categoriesCol, collectionsCol, promptConnectionsCol, changeRequestsCol } from "@/lib/mongodb";
+import { formatTags, docId } from "@/lib/mongodb/prompt-helpers";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -64,18 +65,32 @@ const TRANSLATED_LANGS = ["es","zh","ja","de","fr","pt","ko","tr","ar","ru","hi"
 
 /** Cached prompt metadata fetch — 1 hour TTL, keyed by prompt ID. */
 const getPromptMetadata = unstable_cache(
-  async (id: string) => db.prompt.findUnique({
-    where: { id },
-    select: {
-      title: true,
-      description: true,
-      slug: true,
-      content: true,
-      seoMeta: true,
-      translations: true,
-      category: { select: { name: true } },
-    },
-  }),
+  async (id: string) => {
+    const doc = await promptsCol().findOne(
+      { _id: id } as Record<string, unknown>,
+      { projection: { title: 1, description: 1, slug: 1, content: 1, seoMeta: 1, translations: 1, categoryId: 1 } }
+    );
+    if (!doc) return null;
+
+    let categoryName: string | null = null;
+    if (doc.categoryId) {
+      const cat = await categoriesCol().findOne(
+        { _id: doc.categoryId } as Record<string, unknown>,
+        { projection: { name: 1 } }
+      );
+      categoryName = cat?.name ?? null;
+    }
+
+    return {
+      title: doc.title,
+      description: doc.description ?? null,
+      slug: doc.slug ?? null,
+      content: doc.content,
+      seoMeta: doc.seoMeta ?? null,
+      translations: doc.translations ?? null,
+      category: categoryName ? { name: categoryName } : null,
+    };
+  },
   ["prompt-metadata"],
   { revalidate: 3600, tags: ["prompts"] },
 );
@@ -137,175 +152,194 @@ export default async function PromptPage({ params }: PromptPageProps) {
   const locale = await getLocale();
 
   const isAdmin = session?.user?.role === "ADMIN";
-  
+
   // Admins can view deleted prompts, others cannot
-  const prompt = await db.prompt.findFirst({
-    where: { id, ...(isAdmin ? {} : { deletedAt: null }) },
-    include: {
-      author: {
-        select: {
-          id: true,
-          name: true,
-          username: true,
-          avatar: true,
-          verified: true,
-        },
-      },
-      category: {
-        include: {
-          parent: true,
-        },
-      },
-      tags: {
-        include: {
-          tag: true,
-        },
-      },
-      versions: {
-        orderBy: { version: "desc" },
-        select: {
-          id: true,
-          version: true,
-          content: true,
-          changeNote: true,
-          createdAt: true,
-          author: {
-            select: {
-              name: true,
-              username: true,
-            },
-          },
-        },
-      },
-      _count: {
-        select: { votes: true },
-      },
-      contributors: {
-        select: {
-          id: true,
-          username: true,
-          name: true,
-          avatar: true,
-        },
-      },
-    },
-  });
+  const promptDoc = await promptsCol().findOne(
+    { _id: id, ...(isAdmin ? {} : { deletedAt: null }) } as Record<string, unknown>
+  );
 
-  // Check if user has voted
-  const userVote = session?.user
-    ? await db.promptVote.findUnique({
-        where: {
-          userId_promptId: {
-            userId: session.user.id,
-            promptId: id,
-          },
-        },
-      })
-    : null;
-
-  // Check if user has this prompt in their collection
-  const userCollection = session?.user
-    ? await db.collection.findUnique({
-        where: {
-          userId_promptId: {
-            userId: session.user.id,
-            promptId: id,
-          },
-        },
-      })
-    : null;
-
-  // Fetch related prompts (via PromptConnection with label "related")
-  const relatedConnections = await db.promptConnection.findMany({
-    where: {
-      sourceId: id,
-      label: "related",
-    },
-    orderBy: { order: "asc" },
-    include: {
-      target: {
-        select: {
-          id: true,
-          title: true,
-          slug: true,
-          description: true,
-          type: true,
-          isPrivate: true,
-          isUnlisted: true,
-          deletedAt: true,
-          author: {
-            select: {
-              id: true,
-              name: true,
-              username: true,
-              avatar: true,
-            },
-          },
-          category: {
-            select: {
-              id: true,
-              name: true,
-              slug: true,
-            },
-          },
-          _count: {
-            select: { votes: true },
-          },
-        },
-      },
-    },
-  });
-
-  // Filter out private, unlisted, or deleted related prompts
-  const relatedPrompts = relatedConnections
-    .map((conn) => conn.target)
-    .filter((p) => !p.isPrivate && !p.isUnlisted && !p.deletedAt);
-
-  // Check if prompt has flow connections (previous/next, not "related")
-  const flowConnectionCount = await db.promptConnection.count({
-    where: {
-      OR: [
-        { sourceId: id, label: { not: "related" } },
-        { targetId: id, label: { not: "related" } },
-      ],
-    },
-  });
-  const hasFlowConnections = flowConnectionCount > 0;
-
-  if (!prompt) {
-    notFound();
-  }
+  if (!promptDoc) notFound();
 
   // Check if user can view private prompt
-  if (prompt.isPrivate && prompt.authorId !== session?.user?.id) {
-    notFound();
-  }
+  if (promptDoc.isPrivate && promptDoc.authorId !== session?.user?.id) notFound();
 
-  // Unlisted prompts are accessible via direct link (like YouTube unlisted videos)
-  // They just don't appear in public listings, search results, or feeds
+  // Parallel fetches for all associated data
+  const [
+    authorDoc,
+    categoryDoc,
+    relatedConnections,
+    flowConnectionCount,
+    changeRequestDocs,
+    userCollectionDoc,
+  ] = await Promise.all([
+    usersCol().findOne({ _id: promptDoc.authorId } as Record<string, unknown>),
+    promptDoc.categoryId
+      ? categoriesCol().findOne({ _id: promptDoc.categoryId } as Record<string, unknown>)
+      : Promise.resolve(null),
+    promptConnectionsCol()
+      .find({ sourceId: id, label: "related" } as Record<string, unknown>)
+      .sort({ order: 1 })
+      .toArray(),
+    promptConnectionsCol().countDocuments({
+      $or: [
+        { sourceId: id, label: { $ne: "related" } },
+        { targetId: id, label: { $ne: "related" } },
+      ],
+    } as Record<string, unknown>),
+    changeRequestsCol()
+      .find({ promptId: id } as Record<string, unknown>)
+      .sort({ createdAt: -1 })
+      .toArray(),
+    session?.user?.id
+      ? collectionsCol().findOne({ userId: session.user.id, promptId: id } as Record<string, unknown>)
+      : Promise.resolve(null),
+  ]);
+
+  // Fetch parent category
+  const parentCategoryDoc = categoryDoc?.parentId
+    ? await categoriesCol().findOne({ _id: categoryDoc.parentId } as Record<string, unknown>)
+    : null;
+
+  // Fetch version authors
+  const versionAuthorIds = [...new Set(promptDoc.versions.map((v) => v.createdBy))];
+  const versionAuthorDocs = versionAuthorIds.length > 0
+    ? await usersCol().find({ _id: { $in: versionAuthorIds } } as Record<string, unknown>).toArray()
+    : [];
+  const versionAuthorMap = new Map(versionAuthorDocs.map((u) => [docId(u), u]));
+
+  // Derive contributors: version authors who are not the prompt author
+  const contributorIds = [...new Set(
+    promptDoc.versions
+      .map((v) => v.createdBy)
+      .filter((uid) => uid !== promptDoc.authorId)
+  )];
+  const contributorDocs = contributorIds.length > 0
+    ? await usersCol().find({ _id: { $in: contributorIds } } as Record<string, unknown>).toArray()
+    : [];
+
+  // Fetch related prompt targets
+  const relatedTargetIds = relatedConnections.map((c) => c.targetId);
+  const relatedPromptDocs = relatedTargetIds.length > 0
+    ? await promptsCol()
+        .find({ _id: { $in: relatedTargetIds }, isPrivate: false, isUnlisted: false, deletedAt: null } as Record<string, unknown>)
+        .toArray()
+    : [];
+
+  // Fetch change request authors
+  const crAuthorIds = [...new Set(changeRequestDocs.map((cr) => cr.authorId))];
+  const crAuthorDocs = crAuthorIds.length > 0
+    ? await usersCol().find({ _id: { $in: crAuthorIds } } as Record<string, unknown>).toArray()
+    : [];
+  const crAuthorMap = new Map(crAuthorDocs.map((u) => [docId(u), u]));
+
+  // Fetch related prompt authors + categories
+  const relatedAuthorIds = [...new Set(relatedPromptDocs.map((p) => p.authorId))];
+  const relatedCategoryIds = [...new Set(relatedPromptDocs.map((p) => p.categoryId).filter(Boolean))] as string[];
+  const [relatedAuthorDocs, relatedCategoryDocs] = await Promise.all([
+    relatedAuthorIds.length > 0
+      ? usersCol().find({ _id: { $in: relatedAuthorIds } } as Record<string, unknown>).toArray()
+      : Promise.resolve([]),
+    relatedCategoryIds.length > 0
+      ? categoriesCol().find({ _id: { $in: relatedCategoryIds } } as Record<string, unknown>).toArray()
+      : Promise.resolve([]),
+  ]);
+  const relatedAuthorMap = new Map(relatedAuthorDocs.map((u) => [docId(u), u]));
+  const relatedCategoryMap = new Map(relatedCategoryDocs.map((c) => [docId(c), c]));
+
+  // Assemble the unified prompt object
+  const author = authorDoc!;
+  const prompt = {
+    ...promptDoc,
+    id: docId(promptDoc),
+    author: {
+      id: docId(author),
+      name: author.name ?? null,
+      username: author.username,
+      avatar: author.avatar ?? null,
+      verified: author.verified ?? false,
+    },
+    category: categoryDoc
+      ? {
+          id: docId(categoryDoc),
+          name: categoryDoc.name,
+          slug: categoryDoc.slug,
+          parent: parentCategoryDoc
+            ? { id: docId(parentCategoryDoc), name: parentCategoryDoc.name, slug: parentCategoryDoc.slug }
+            : null,
+        }
+      : null,
+    tags: formatTags(promptDoc.tags),
+    versions: promptDoc.versions.map((v) => {
+      const vAuthor = versionAuthorMap.get(v.createdBy);
+      return {
+        id: v._id as unknown as string,
+        version: v.version,
+        content: v.content,
+        changeNote: v.changeNote ?? null,
+        createdAt: v.createdAt,
+        author: {
+          name: vAuthor?.name ?? null,
+          username: vAuthor?.username ?? "unknown",
+        },
+      };
+    }),
+    _count: { votes: promptDoc.voteCount ?? 0 },
+    contributors: contributorDocs.map((u) => ({
+      id: docId(u),
+      username: u.username,
+      name: u.name ?? null,
+      avatar: u.avatar ?? null,
+    })),
+  };
+
+  const hasVoted = session?.user?.id
+    ? promptDoc.votes.some((v) => v.userId === session.user!.id)
+    : false;
+  const inCollection = !!userCollectionDoc;
+  const voteCount = promptDoc.voteCount ?? 0;
+  const hasFlowConnections = flowConnectionCount > 0;
+
+  // Assembled related prompts
+  const relatedPrompts = relatedPromptDocs.map((rp) => {
+    const rAuthor = relatedAuthorMap.get(rp.authorId);
+    const rCategory = rp.categoryId ? relatedCategoryMap.get(rp.categoryId) : undefined;
+    return {
+      id: docId(rp),
+      title: rp.title,
+      slug: rp.slug ?? null,
+      description: rp.description ?? null,
+      type: rp.type,
+      isPrivate: rp.isPrivate,
+      isUnlisted: rp.isUnlisted,
+      deletedAt: rp.deletedAt ?? null,
+      author: rAuthor
+        ? { id: docId(rAuthor), name: rAuthor.name ?? null, username: rAuthor.username, avatar: rAuthor.avatar ?? null }
+        : { id: "", name: null, username: "unknown", avatar: null },
+      category: rCategory
+        ? { id: docId(rCategory), name: rCategory.name, slug: rCategory.slug }
+        : null,
+      _count: { votes: rp.voteCount ?? 0 },
+    };
+  });
+
+  // Assembled change requests
+  const changeRequests = changeRequestDocs.map((cr) => {
+    const crAuthor = crAuthorMap.get(cr.authorId);
+    return {
+      id: docId(cr),
+      status: cr.status,
+      proposedTitle: cr.proposedTitle ?? null,
+      originalTitle: cr.originalTitle ?? null,
+      reason: cr.reason ?? null,
+      createdAt: cr.createdAt,
+      author: crAuthor
+        ? { id: docId(crAuthor), name: crAuthor.name ?? null, username: crAuthor.username, avatar: crAuthor.avatar ?? null }
+        : { id: "", name: null, username: "unknown", avatar: null },
+    };
+  });
 
   const isOwner = session?.user?.id === prompt.authorId;
   const canEdit = isOwner || isAdmin;
-  const voteCount = prompt._count?.votes ?? 0;
-  const hasVoted = !!userVote;
-  const inCollection = !!userCollection;
-
-  // Fetch change requests for this prompt
-  const changeRequests = await db.changeRequest.findMany({
-    where: { promptId: id },
-    orderBy: { createdAt: "desc" },
-    include: {
-      author: {
-        select: {
-          id: true,
-          name: true,
-          username: true,
-          avatar: true,
-        },
-      },
-    },
-  });
-
   const pendingCount = changeRequests.filter((cr) => cr.status === "PENDING").length;
   const tChanges = await getTranslations("changeRequests");
 
@@ -321,11 +355,11 @@ export default async function PromptPage({ params }: PromptPageProps) {
     REJECTED: X,
   };
 
-  // Get delist reason (cast to expected type after Prisma migration)
+  // Get delist reason
   const delistReason = (prompt as { delistReason?: string | null }).delistReason as
     | "TOO_SHORT" | "NOT_ENGLISH" | "LOW_QUALITY" | "NOT_LLM_INSTRUCTION" | "MANUAL" | null;
 
-  // Get works best with fields (cast until Prisma types are regenerated)
+  // Get works best with fields
   const bestWithModels = (prompt as unknown as { bestWithModels?: string[] }).bestWithModels || [];
   const bestWithMCP = (prompt as unknown as { bestWithMCP?: { command: string; tools?: string[] }[] }).bestWithMCP || [];
 
@@ -451,7 +485,7 @@ export default async function PromptPage({ params }: PromptPageProps) {
             </div>
           </div>
         </div>
-        
+
         {/* Description */}
         {prompt.description && (
           <p className="text-muted-foreground">{prompt.description}</p>
@@ -516,9 +550,9 @@ export default async function PromptPage({ params }: PromptPageProps) {
             <span>{prompt.contributors.length + 1} {t("contributors")}</span>
           </div>
         )}
-        <AnimatedDate 
-          date={prompt.createdAt} 
-          relativeText={formatDistanceToNow(prompt.createdAt, locale)} 
+        <AnimatedDate
+          date={prompt.createdAt}
+          relativeText={formatDistanceToNow(prompt.createdAt, locale)}
           locale={locale}
         />
       </div>
@@ -628,9 +662,9 @@ export default async function PromptPage({ params }: PromptPageProps) {
         <TabsContent value="content" className="space-y-4 mt-0">
           {/* Media Preview with User Examples (for image/video prompts) */}
           {prompt.mediaUrl && (
-            <UserExamplesSection 
-              mediaUrl={prompt.mediaUrl} 
-              title={prompt.title} 
+            <UserExamplesSection
+              mediaUrl={prompt.mediaUrl}
+              title={prompt.title}
               type={prompt.type}
               promptId={prompt.id}
               isLoggedIn={!!session?.user}
@@ -647,7 +681,7 @@ export default async function PromptPage({ params }: PromptPageProps) {
                 {prompt.requiredMediaType === "VIDEO" && <Video className="h-3.5 w-3.5" />}
                 {prompt.requiredMediaType === "DOCUMENT" && <FileText className="h-3.5 w-3.5" />}
                 <span className="text-xs font-medium">
-                  {prompt.requiredMediaType === "IMAGE" 
+                  {prompt.requiredMediaType === "IMAGE"
                     ? t("requiresImage", { count: prompt.requiredMediaCount })
                     : prompt.requiredMediaType === "VIDEO"
                     ? t("requiresVideo", { count: prompt.requiredMediaCount })
@@ -656,8 +690,8 @@ export default async function PromptPage({ params }: PromptPageProps) {
               </div>
             )}
             {prompt.type === "SKILL" ? (
-              <SkillViewer 
-                content={prompt.content} 
+              <SkillViewer
+                content={prompt.content}
                 promptId={prompt.id}
                 promptSlug={prompt.slug ?? undefined}
               />
@@ -733,8 +767,8 @@ export default async function PromptPage({ params }: PromptPageProps) {
               <Terminal className="h-4 w-4 text-muted-foreground" />
               <span className="text-muted-foreground">{t("mcpTools")}:</span>
               <div className="flex flex-wrap gap-1.5">
-                {bestWithMCP.flatMap((mcp, mcpIndex) => 
-                  mcp.tools && mcp.tools.length > 0 
+                {bestWithMCP.flatMap((mcp, mcpIndex) =>
+                  mcp.tools && mcp.tools.length > 0
                     ? mcp.tools.map((tool, toolIndex) => (
                         <Tooltip key={`${mcpIndex}-${toolIndex}`}>
                           <TooltipTrigger asChild>
@@ -828,8 +862,8 @@ export default async function PromptPage({ params }: PromptPageProps) {
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-base font-semibold">{t("versionHistory")}</h3>
               <div className="flex items-center gap-2">
-                <VersionCompareModal 
-                  versions={prompt.versions} 
+                <VersionCompareModal
+                  versions={prompt.versions}
                   currentContent={prompt.content}
                   promptType={prompt.type}
                   structuredFormat={prompt.structuredFormat}
@@ -908,14 +942,14 @@ export default async function PromptPage({ params }: PromptPageProps) {
                   const StatusIcon = statusIcons[cr.status];
                   const hasTitleChange = cr.proposedTitle && cr.proposedTitle !== cr.originalTitle;
                   return (
-                    <Link 
-                      key={cr.id} 
+                    <Link
+                      key={cr.id}
                       href={`/prompts/${id}/changes/${cr.id}`}
                       className="flex items-center gap-3 px-4 py-3 hover:bg-accent/50 transition-colors first:rounded-t-lg last:rounded-b-lg"
                     >
                       <div className={`p-1.5 rounded-full shrink-0 ${
-                        cr.status === "PENDING" 
-                          ? "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400" 
+                        cr.status === "PENDING"
+                          ? "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400"
                           : cr.status === "APPROVED"
                           ? "bg-green-500/10 text-green-600 dark:text-green-400"
                           : "bg-red-500/10 text-red-600 dark:text-red-400"

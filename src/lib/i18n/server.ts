@@ -2,7 +2,7 @@
 
 import { cookies } from "next/headers";
 import { LOCALE_COOKIE, supportedLocales } from "./config";
-import { db } from "@/lib/db";
+import { usersCol } from "@/lib/mongodb";
 import { auth } from "@/lib/auth";
 
 /**
@@ -25,10 +25,10 @@ export async function setLocaleServer(locale: string): Promise<void> {
   // Update database if user is logged in
   const session = await auth();
   if (session?.user?.id) {
-    await db.user.update({
-      where: { id: session.user.id },
-      data: { locale },
-    });
+    await usersCol().updateOne(
+      { _id: session.user.id } as Record<string, unknown>,
+      { $set: { locale } }
+    );
   }
 }
 
@@ -36,11 +36,11 @@ export async function setLocaleServer(locale: string): Promise<void> {
  * Sync locale from database to cookie on login
  */
 export async function syncLocaleFromUser(userId: string): Promise<void> {
-  const user = await db.user.findUnique({
-    where: { id: userId },
-    select: { locale: true },
-  });
-  
+  const user = await usersCol().findOne(
+    { _id: userId } as Record<string, unknown>,
+    { projection: { locale: 1 } }
+  );
+
   if (user?.locale) {
     const cookieStore = await cookies();
     cookieStore.set(LOCALE_COOKIE, user.locale, {

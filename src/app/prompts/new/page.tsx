@@ -4,7 +4,8 @@ import { getTranslations } from "next-intl/server";
 import { Info } from "lucide-react";
 import { auth } from "@/lib/auth";
 import { PromptForm } from "@/components/prompts/prompt-form";
-import { db } from "@/lib/db";
+import { categoriesCol, tagsCol } from "@/lib/mongodb";
+import { docId } from "@/lib/mongodb/prompt-helpers";
 import { isAIGenerationEnabled, getAIModelName } from "@/lib/ai/generation";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 
@@ -32,21 +33,30 @@ export default async function NewPromptPage({ searchParams }: PageProps) {
     redirect("/login");
   }
 
-  // Fetch categories for the form (with parent info for nesting)
-  const categories = await db.category.findMany({
-    orderBy: [{ order: "asc" }, { name: "asc" }],
-    select: {
-      id: true,
-      name: true,
-      slug: true,
-      parentId: true,
-    },
-  });
+  const [categoryDocs, tagDocs] = await Promise.all([
+    categoriesCol()
+      .find({}, { projection: { name: 1, slug: 1, parentId: 1 } })
+      .sort({ order: 1, name: 1 })
+      .toArray(),
+    tagsCol()
+      .find({}, { projection: { name: 1, slug: 1, color: 1 } })
+      .sort({ name: 1 })
+      .toArray(),
+  ]);
 
-  // Fetch tags for the form
-  const tags = await db.tag.findMany({
-    orderBy: { name: "asc" },
-  });
+  const categories = categoryDocs.map((c) => ({
+    id: docId(c),
+    name: c.name,
+    slug: c.slug,
+    parentId: c.parentId ?? null,
+  }));
+
+  const tags = tagDocs.map((t) => ({
+    id: docId(t),
+    name: t.name,
+    slug: t.slug,
+    color: t.color,
+  }));
 
   // Check if AI generation is enabled
   const aiGenerationEnabled = await isAIGenerationEnabled();

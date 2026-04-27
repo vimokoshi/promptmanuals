@@ -1,5 +1,5 @@
-import { db } from "@/lib/db";
-import { WebhookEvent } from "@prisma/client";
+import { webhookConfigsCol } from "@/lib/mongodb";
+import type { WebhookEvent } from "@/lib/mongodb/schemas";
 
 interface PromptData {
   id: string;
@@ -262,14 +262,9 @@ function replacePlaceholders(template: string, prompt: PromptData): string {
 export async function triggerWebhooks(event: WebhookEvent, prompt: PromptData): Promise<void> {
   try {
     // Get all enabled webhooks for this event
-    const webhooks = await db.webhookConfig.findMany({
-      where: {
-        isEnabled: true,
-        events: {
-          has: event,
-        },
-      },
-    });
+    const webhooks = await webhookConfigsCol()
+      .find({ isEnabled: true, events: { $in: [event] } } as Record<string, unknown>)
+      .toArray();
 
     if (webhooks.length === 0) {
       return;
