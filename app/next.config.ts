@@ -2,7 +2,6 @@ import { withSentryConfig } from "@sentry/nextjs";
 import type { NextConfig } from "next";
 import createNextIntlPlugin from "next-intl/plugin";
 import createMDX from "@next/mdx";
-import path from "path";
 
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 const withMDX = createMDX({
@@ -79,7 +78,7 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default withSentryConfig(withMDX(withNextIntl(nextConfig)), {
+const sentryWebpackPluginOptions = {
   // For all available options, see:
   // https://www.npmjs.com/package/@sentry/webpack-plugin#options
 
@@ -114,4 +113,9 @@ export default withSentryConfig(withMDX(withNextIntl(nextConfig)), {
       removeDebugLogging: true,
     },
   },
-});
+};
+
+// Only wrap with Sentry when SENTRY_AUTH_TOKEN is present (CI/Vercel only)
+export default process.env.SENTRY_AUTH_TOKEN
+  ? withSentryConfig(withMDX(withNextIntl(nextConfig)), sentryWebpackPluginOptions)
+  : withMDX(withNextIntl(nextConfig));
