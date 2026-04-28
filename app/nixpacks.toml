@@ -1,2 +1,2 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "vips", "pkg-config"]
+nixPkgs = ["vips", "pkg-config"]
