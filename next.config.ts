@@ -77,39 +77,17 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default withSentryConfig(withMDX(withNextIntl(nextConfig)), {
-  // For all available options, see:
-  // https://www.npmjs.com/package/@sentry/webpack-plugin#options
-
+const sentryOptions = {
   org: "promptschat",
-
   project: "prompts-chat",
-
-  // Only print logs for uploading source maps in CI
   silent: !process.env.CI,
-
-  // For all available options, see:
-  // https://docs.sentry.io/platforms/javascript/guides/nextjs/manual-setup/
-
-  // Upload a larger set of source maps for prettier stack traces (increases build time)
   widenClientFileUpload: true,
-
-  // tunnelRoute removed — was proxying all browser Sentry events through Vercel edge,
-  // generating unnecessary edge requests ($2.45/M) and function invocations ($0.60/M).
-  // Estimated savings: $100-400/month. Trade-off: some ad-blockers may block direct Sentry calls.
-  // See: https://github.com/f/prompts.chat/issues/1085
-
   webpack: {
-    // Enables automatic instrumentation of Vercel Cron Monitors. (Does not yet work with App Router route handlers.)
-    // See the following for more information:
-    // https://docs.sentry.io/product/crons/
-    // https://vercel.com/docs/cron-jobs
-    automaticVercelMonitors: true,
-
-    // Tree-shaking options for reducing bundle size
-    treeshake: {
-      // Automatically tree-shake Sentry logger statements to reduce bundle size
-      removeDebugLogging: true,
-    },
+    automaticVercelMonitors: false,
+    treeshake: { removeDebugLogging: true },
   },
-});
+};
+
+export default process.env.SENTRY_AUTH_TOKEN
+  ? withSentryConfig(withMDX(withNextIntl(nextConfig)), sentryOptions)
+  : withMDX(withNextIntl(nextConfig));
