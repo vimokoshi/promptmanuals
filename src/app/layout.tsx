@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Inter, Noto_Sans_Arabic, Geist_Mono, Playfair_Display } from "next/font/google";
 import { headers } from "next/headers";
+
+export const dynamic = "force-dynamic";
 import { getMessages, getLocale } from "next-intl/server";
 import { Providers } from "@/components/providers";
 import { Header } from "@/components/layout/header";
