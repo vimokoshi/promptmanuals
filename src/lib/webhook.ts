@@ -1,6 +1,5 @@
 import { webhookConfigsCol } from "@/lib/mongodb";
 import type { WebhookEvent } from "@/lib/mongodb/schemas";
-export { WEBHOOK_PLACEHOLDERS, SLACK_PRESET_PAYLOAD } from "@/lib/webhook-constants";
 import { WEBHOOK_PLACEHOLDERS } from "@/lib/webhook-constants";
 
 interface PromptData {
