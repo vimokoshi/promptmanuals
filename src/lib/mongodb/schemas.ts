@@ -38,14 +38,30 @@ function createMongoClient(): MongoClient {
   }
   return new MongoClient(uri, {
     maxPoolSize: 10,
-    minPoolSize: 2,
-    maxIdleTimeMS: 30_000,
-    serverSelectionTimeoutMS: 10_000,
-    connectTimeoutMS: 10_000,
+    serverSelectionTimeoutMS: 30_000,
+    connectTimeoutMS: 30_000,
+    socketTimeoutMS: 30_000,
   });
 }
 
+function isClientClosed(client: MongoClient): boolean {
+  try {
+    // topology is null/destroyed after close() is called
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const topo = (client as any).topology;
+    if (!topo) return true;
+    if (typeof topo.isDestroyed === "function" && topo.isDestroyed()) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 export function getDb(): Db {
+  if (globalForMongo.mongoClient && isClientClosed(globalForMongo.mongoClient)) {
+    globalForMongo.mongoClient = undefined;
+    globalForMongo.mongoDb = undefined;
+  }
   if (!globalForMongo.mongoClient) {
     globalForMongo.mongoClient = createMongoClient();
   }
@@ -56,6 +72,10 @@ export function getDb(): Db {
 }
 
 export function getClient(): MongoClient {
+  if (globalForMongo.mongoClient && isClientClosed(globalForMongo.mongoClient)) {
+    globalForMongo.mongoClient = undefined;
+    globalForMongo.mongoDb = undefined;
+  }
   if (!globalForMongo.mongoClient) {
     globalForMongo.mongoClient = createMongoClient();
   }
