@@ -16,16 +16,6 @@ import { MongoClient, Db, Collection, Document, ObjectId } from "mongodb";
 // Environment
 // ---------------------------------------------------------------------------
 
-const MONGODB_URI =
-  process.env.MONGODB_URI ??
-  (() => {
-    throw new Error(
-      "MONGODB_URI environment variable is not set.\n" +
-        "Set it to your MongoDB Atlas connection string:\n" +
-        '  mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/<db>?retryWrites=true&w=majority'
-    );
-  })();
-
 const DB_NAME = process.env.MONGODB_DB ?? "promptmanuals";
 
 // ---------------------------------------------------------------------------
@@ -38,7 +28,15 @@ const globalForMongo = globalThis as unknown as {
 };
 
 function createMongoClient(): MongoClient {
-  return new MongoClient(MONGODB_URI, {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error(
+      "MONGODB_URI environment variable is not set.\n" +
+        "Set it to your MongoDB Atlas connection string:\n" +
+        '  mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/<db>?retryWrites=true&w=majority'
+    );
+  }
+  return new MongoClient(uri, {
     maxPoolSize: 10,
     minPoolSize: 2,
     maxIdleTimeMS: 30_000,
